@@ -449,6 +449,26 @@ static Modbus_ExCode_et plc_protocol_validate_request( Modbus_Rx_st const *modbu
 			}
 			return Modbus_ExCode_Normal;
 
+		case Modbus_FunCode_Force_Holding_Reg:
+			if( length != 8U )
+			{
+				return Modbus_ExCode_Illegal_DataValue;
+			}
+			if( !plc_holding_addr_is_writable( modbus_rx->starting_address_write ) )
+			{
+				return Modbus_ExCode_Illegal_Address;
+			}
+			if( !plc_holding_word_value_is_valid( modbus_rx->starting_address_write,
+				modbus_rx->data_write[ 0 ] ) )
+			{
+				return Modbus_ExCode_Illegal_DataValue;
+			}
+			if( !plc_holding_write_combined_values_are_valid( modbus_rx ) )
+			{
+				return Modbus_ExCode_Illegal_DataValue;
+			}
+			return plc_holding_write_state_validate( modbus_rx );
+
 		case Modbus_FunCode_Preset_Multiple_Reg:
 			return plc_protocol_validate_write_holding( modbus_rx, length );
 
@@ -526,6 +546,7 @@ static uint16_t modbus_slave( uint8_t * rcvd_frame, uint16_t length, uint8_t *tx
 		if( modbus_rx.function_code &&
 			( modbus_rx.function_code != Modbus_FunCode_Read_Holding_Reg ) &&
 			( modbus_rx.function_code != Modbus_FunCode_Read_Input_Reg ) &&
+			( modbus_rx.function_code != Modbus_FunCode_Force_Holding_Reg ) &&
 			( modbus_rx.function_code != Modbus_FunCode_Preset_Multiple_Reg ) )
 		{
 			return modbus_exception_response( 'R', &modbus_rx, tx_buf, Modbus_ExCode_Illegal_FunCode );

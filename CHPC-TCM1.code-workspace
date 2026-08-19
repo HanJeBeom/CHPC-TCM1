@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"*.nc": "c",
+			"*.h": "c",
+			"*.c": "c"
+		},
+		"editor.insertSpaces": false
+	}
+}

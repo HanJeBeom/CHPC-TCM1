@@ -138,7 +138,13 @@ static bool plc_write_touches( Modbus_Rx_st const *modbus_rx, uint16_t start, ui
  *****************************************************************************/
 static bool plc_holding_addr_is_readable( uint16_t addr )
 {
-	if( addr <= MBS_HR_REVISION )
+	/*
+	 * PLCs may read the system area and the first control-loop area in one
+	 * contiguous FC03 request.  Addresses 7..9 are defined system registers
+	 * (alarm reset and parameter save), so rejecting them makes the complete
+	 * request fail before PB/Ti/Td can be returned.
+	 */
+	if( addr <= MBS_HR_SAVE_PARAMETER )
 	{
 		return true;
 	}

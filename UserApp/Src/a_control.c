@@ -128,6 +128,7 @@ static void autotune_relay_method( control_loop_config_st *pCfg, control_loop_in
 
 
 static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *pCfg );
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
@@ -577,6 +578,8 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		}
 		else
 		{
+			/* Apply PB/Ti/Td written by the PLC without requiring CL Disable. */
+			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg );
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
 			pInst->MV = PID2DOF_Calculate_backward_euler( &pid_inst[ pInst->CH ], sp, pv, pCfg->CoolHeat );
@@ -792,6 +795,42 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->b  = (2.0f * pPid->lambda * pPid->Td) / pPid->Ts;
 	pPid->v_prev = 0.0f;
 	pPid->PV_prev = 0.0f;
+}
+
+/******************************************************************************
+ * @brief Apply changed PLC PID gains while preserving the running PID state.
+ *
+ * The current controller caches PB/Ti/Td as floating-point gains in pid_st.
+ * R00 calculated them directly from the control configuration every cycle,
+ * but the current implementation previously refreshed them only while the
+ * loop was disabled.  Refresh only the gain-dependent values here so a PLC
+ * tuning write takes effect on the next PID calculation without resetting the
+ * setpoint/PV history.  When Ti is set to zero, clear the accumulated integral
+ * because integral action has explicitly been disabled.
+ ******************************************************************************/
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg )
+{
+	if( !pPid || !pCfg ) return;
+
+	const float kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
+	const float ti = pCfg->Ti * MULTIPLY_Ti_INT_TO_FLOAT;
+	const float td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;
+
+	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) ) return;
+
+	pPid->Kp = kp;
+	pPid->Ti = ti;
+	pPid->Td = td;
+	pPid->Kaw = ( ti > 0.0f ) ? ( 1.0f / ti ) : 0.0f;
+
+	if( ti <= 0.0f )
+	{
+		pPid->I = 0.0f;
+	}
+
+	/* Keep the derived values coherent for the alternate PID implementation. */
+	pPid->p0 = ( 2.0f * pPid->Kp * pPid->Td ) / pPid->Ts;
+	pPid->b = ( 2.0f * pPid->lambda * pPid->Td ) / pPid->Ts;
 }
 
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv )

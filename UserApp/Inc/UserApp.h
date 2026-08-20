@@ -47,7 +47,7 @@ extern "C" {
 #include <a_temp.h>
 #include <a_terminal.h>
 #include <a_test_func.h>
-#include <a_test_smps.h>
+//#include <a_test_smps.h>
 #include <a_usbcdc.h>
 
 /*****************************************************************************/

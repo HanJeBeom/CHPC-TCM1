@@ -92,6 +92,7 @@ typedef struct controller_variable_struct_Tag
 typedef struct {
 	float Kp, Ti, Td, alpha, lambda, Ts;
 	float u_min, u_max;
+	uint16_t EffectivePb, EffectiveTi, EffectiveTd;
 
 	// Setpoint filter
 	float b0, b1, c0, c1;
@@ -120,6 +121,7 @@ static loop_fault_status_ut control_loop_get_fault( int loop_idx );
 static void control_loop_set_fault( int loop_idx, loop_fault_status_ut flt );
 static void control_loop_set_config( uint16_t data[ ], int loop_idx );
 static const control_loop_config_st* const control_loop_get_config( int loop_idx );
+static bool control_loop_get_pid_parameter_status( int loop_idx, pid_parameter_status_st *status );
 static void control_loop_clear_alarm( uint16_t clear_bitmask_hi, uint16_t clear_bitmask_lo );
 static __RAM_FUNC int32_t get_temperature( control_loop_config_st *pCfg, int loop_idx );                        // for fast run
 static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control_loop_instance_st *pInst );     // for fast run
@@ -144,6 +146,7 @@ const controller_st Controller =
     .SetFault = control_loop_set_fault,
     .SetConfig = control_loop_set_config,
     .GetConfig = control_loop_get_config,
+    .GetPidParameterStatus = control_loop_get_pid_parameter_status,
     .ClearAlarm = control_loop_clear_alarm,
     .SetDefault = set_default_config,
 };
@@ -460,6 +463,32 @@ static const control_loop_config_st* const control_loop_get_config( int loop_idx
 }
 
 /******************************************************************************
+ * @brief Get the PID parameters currently applied to the control algorithm.
+ *        Configured parameters are applied by PID_instance_Init while the
+ *        channel is disabled. Pending is true when configuration differs from
+ *        the last applied parameters.
+ * @param loop_idx index of control loop
+ * @param status destination for effective parameters and pending state
+ * @return true on success, false for an invalid argument
+ *****************************************************************************/
+static bool control_loop_get_pid_parameter_status( int loop_idx, pid_parameter_status_st *status )
+{
+	if( ( 0 > loop_idx ) || ( loop_idx >= MAX_CONTROL_LOOP ) || ( NULL == status ) ) return false;
+
+	const pid_st * const pPid = &pid_inst[ loop_idx ];
+	const control_loop_config_st * const pCfg = &ControllerVars.Cfg[ loop_idx ];
+
+	status->EffectivePb = pPid->EffectivePb;
+	status->EffectiveTi = pPid->EffectiveTi;
+	status->EffectiveTd = pPid->EffectiveTd;
+	status->Pending = ( pCfg->Pb != pPid->EffectivePb )
+		|| ( pCfg->Ti != pPid->EffectiveTi )
+		|| ( pCfg->Td != pPid->EffectiveTd );
+
+	return true;
+}
+
+/******************************************************************************
  * @brief Clear fault status of control loop.
  * @brief It should be cleared alarm by MODBUS command from PLC.
  *
@@ -768,6 +797,9 @@ static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg
  ******************************************************************************/
 static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *pCfg )
 {
+	pPid->EffectivePb = pCfg->Pb;
+	pPid->EffectiveTi = pCfg->Ti;
+	pPid->EffectiveTd = pCfg->Td;
 	pPid->Kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f; // Kp = 1 / Pb
 	pPid->Ti = pCfg->Ti * MULTIPLY_Ti_INT_TO_FLOAT;
 	pPid->Td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;

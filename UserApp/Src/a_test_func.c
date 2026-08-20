@@ -27,7 +27,7 @@
 #define TF_TASK_CYCLE_TIME		0.01f	// 10ms line scan
 #define TF_MEAS_PERIOD			0.5f	// continuous measurement stream period
 #define TF_LOG_PERIOD			0.1f	// CL1/CHPP-8021 CSV snapshot period
-#define TF_LOG_COLUMNS			44
+#define TF_LOG_COLUMNS			48
 #define TF_LOG_LINE_MAX		640
 #define TF_CAL_HB_PERIOD		0.5f	// calibration heartbeat event period
 #define TF_GET_SETTLE_TIME		0.5f	// wait for a fresh ADC value after sensor type change
@@ -161,7 +161,8 @@ static AppTimerData_ut tf_get_hb_timer = { .All = 0 };
 
 static const char tf_log_csv_header[] =
 	"timestamp_ms,sample_seq,usb_dropped_count,system_run,system_ready,cl1_enable,input_type,input_channel,"
-	"output_type,output_channel,control_period_ms,pb_tenth_pct,ti_100ms,td_10ms,"
+	"output_type,output_channel,control_period_ms,configured_pb_tenth_pct,configured_ti_100ms,configured_td_10ms,"
+	"effective_pb_tenth_pct,effective_ti_100ms,effective_td_10ms,pid_params_pending,"
 	"output_min_permille,output_max_permille,control_type_u16,cool_heat_mode_u16,output_delay_s,start_delay_s,"
 	"rtd_ch1_mdegc,rtd_ch2_mdegc,smps_id,sv_mdegc,pv_mdegc,error_mdegc,mv_permille,ctrl_fault_u16,"
 	"smps_read_seq_u32,smps_data_age_ms,smps_power_cmd_w,smps_status_u16,"
@@ -1176,7 +1177,7 @@ static void tf_cmd_log( const char * s )
 }
 
 /******************************************************************************
- * @brief Capture and enqueue one 44-column CSV snapshot.
+ * @brief Capture and enqueue one 48-column CSV snapshot.
  *****************************************************************************/
 static void tf_log_stream_task( void )
 {
@@ -1194,7 +1195,9 @@ static void tf_log_stream_task( void )
 	}
 
 	const control_loop_config_st * const pCfg = Controller.GetConfig( 0 );
-	if( ( NULL == pCfg ) || ( tf.log.smps_id >= MAX_SMPS_ID ) )
+	pid_parameter_status_st pid_status = { 0 };
+	if( ( NULL == pCfg ) || !Controller.GetPidParameterStatus( 0, &pid_status )
+		|| ( tf.log.smps_id >= MAX_SMPS_ID ) )
 	{
 		tf.log.on = false;
 		AppTimer.Stop( &tf_log_timer );
@@ -1215,7 +1218,7 @@ static void tf_log_stream_task( void )
 
 	int n = snprintf( tf_log_line, sizeof( tf_log_line ),
 		"%lu,%lu,%lu,%u,%u,%u,%u,%d,%u,%d,"
-		"%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,"
+		"%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,"
 		"%ld,%ld,%u,%ld,%ld,%ld,%ld,%u,"
 		"%lu,%lu,%d,%u,%u,%u,"
 		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u\r\n",
@@ -1233,6 +1236,10 @@ static void tf_log_stream_task( void )
 		( unsigned int )pCfg->Pb,
 		( unsigned int )pCfg->Ti,
 		( unsigned int )pCfg->Td,
+		( unsigned int )pid_status.EffectivePb,
+		( unsigned int )pid_status.EffectiveTi,
+		( unsigned int )pid_status.EffectiveTd,
+		( unsigned int )pid_status.Pending,
 		( int )pCfg->OutputMin,
 		( int )pCfg->OutputMax,
 		( unsigned int )pCfg->ControlType,

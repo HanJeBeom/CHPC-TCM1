@@ -24,6 +24,11 @@
 #define PLC_LOOP_OUTPUT_MIN_OFFSET		( MBS_HR_CH1_OUTPUT_MIN - MBS_HR_CH1_SV_L )
 #define PLC_SMPS_CONFIG_WRITABLE_MASK	( 0x01F8U )
 #define PLC_RTU_MIN_REQUEST_BYTES		( 8U )
+#define SAFETY_TIME						( 0.001f )
+#define MODBUS_FRAME_IDLE_CHAR			( 3.5f )
+#define UART_CHAR_MAX_BIT				( 11.0f )
+#define UART_CHAR_TIME					( UART_CHAR_MAX_BIT / PLC_UART_BAUDRATE )
+#define MODBUS_FRAME_IDLE_TIME			( ( MODBUS_FRAME_IDLE_CHAR * UART_CHAR_TIME ) + SAFETY_TIME )
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -36,6 +41,7 @@ static void update_slave_input_regs( void );
 static void update_setting_from_slave_holding_regs( void );
 
 static uint16_t modbus_slave( uint8_t * rcvd_frame, uint16_t length, uint8_t *tx_buf );
+#if 0 /* Current-branch PLC validation is disabled; use the R00 communication path. */
 static Modbus_ExCode_et plc_protocol_validate_request( Modbus_Rx_st const *modbus_rx, uint16_t length );
 static Modbus_ExCode_et plc_protocol_validate_write_holding( Modbus_Rx_st const *modbus_rx, uint16_t length );
 static bool plc_word_in_i16_range( uint16_t word, int16_t min, int16_t max );
@@ -49,6 +55,7 @@ static uint16_t plc_holding_after_write( Modbus_Rx_st const *modbus_rx, uint16_t
 static int32_t plc_dint_after_write( Modbus_Rx_st const *modbus_rx, uint16_t addr_l );
 static uint16_t modbus_slave_resp_plc_preset_multiple_reg( uint8_t protocol, Modbus_Rx_st *modbus_rx, DataBlock_st const *db,
 														   uint8_t *tx_buf );
+#endif
 
 /*****************************************************************************/
 /** LOCAL VARIABLES **********************************************************/
@@ -77,7 +84,7 @@ Modbus_Server_st MBS = {
 		[ Modbus_FunCode_Force_Single_Coil ] = modbus_slave_resp_force_single_coil,
 		[ Modbus_FunCode_Force_Holding_Reg ] = modbus_slave_resp_preset_holding_reg,
 		[ Modbus_FunCode_Force_Multiple_Coils ] = modbus_slave_resp_force_multiple_coils,
-		[ Modbus_FunCode_Preset_Multiple_Reg ] = modbus_slave_resp_plc_preset_multiple_reg,
+		[ Modbus_FunCode_Preset_Multiple_Reg ] = modbus_slave_resp_preset_multiple_reg,
 		[ Modbus_FunCode_Read_Write_4X_Reg ] = modbus_slave_resp_read_write_4x_reg,
 	},
 };
@@ -86,6 +93,7 @@ Modbus_Server_st MBS = {
 /** FUNCTION DEFINITIONS *****************************************************/
 /*****************************************************************************/
 
+#if 0 /* Current-branch PLC validation is disabled; use the R00 communication path. */
 /******************************************************************************
  * @brief Check whether a signed 16-bit Modbus word is in range.
  *****************************************************************************/
@@ -518,6 +526,7 @@ static uint16_t modbus_slave_resp_plc_preset_multiple_reg( uint8_t protocol, Mod
 									  NULL,
 									  tx_buf );
 }
+#endif
 
 /******************************************************************************
  * @brief MODBUS Slave
@@ -531,41 +540,13 @@ static uint16_t modbus_slave( uint8_t * rcvd_frame, uint16_t length, uint8_t *tx
 {
 	uint16_t tx_len = 0;
 	Modbus_Rx_st modbus_rx = { 0 };
-	Modbus_ExCode_et ex_code = Modbus_ExCode_Normal;
-
-	if( length < PLC_RTU_MIN_REQUEST_BYTES )
-	{
-		return 0;
-	}
-
-	ex_code = MBS.RxFrameCheck( 'R', rcvd_frame, length, &MBSDB, &modbus_rx );
-
-	if( ( Modbus_ExCode_Normal != ex_code ) &&
-		( 0 == modbus_rx.MBAP_Header.Unit_ID ) &&
-		( 0 == modbus_rx.function_code ) )
-	{
-		return 0;
-	}
+	Modbus_ExCode_et ex_code = MBS.RxFrameCheck( 'R', rcvd_frame, length, &MBSDB, &modbus_rx );
 
 	if( modbus_rx.MBAP_Header.Unit_ID == 0 || modbus_rx.MBAP_Header.Unit_ID == DIO.GetBoardID() )
 	{
-		if( modbus_rx.function_code &&
-			( modbus_rx.function_code != Modbus_FunCode_Read_Holding_Reg ) &&
-			( modbus_rx.function_code != Modbus_FunCode_Read_Input_Reg ) &&
-			( modbus_rx.function_code != Modbus_FunCode_Force_Holding_Reg ) &&
-			( modbus_rx.function_code != Modbus_FunCode_Preset_Multiple_Reg ) )
-		{
-			return modbus_exception_response( 'R', &modbus_rx, tx_buf, Modbus_ExCode_Illegal_FunCode );
-		}
-
 		if( Modbus_ExCode_Normal == ex_code )
 		{
-			ex_code = plc_protocol_validate_request( &modbus_rx, length );
-			if( Modbus_ExCode_Normal != ex_code )
-			{
-				tx_len = modbus_exception_response( 'R', &modbus_rx, tx_buf, ex_code );
-			}
-			else if( MBS.Function[ modbus_rx.function_code ] )
+			if( MBS.Function[ modbus_rx.function_code ] )
 			{
 				tx_len = MBS.Function[ modbus_rx.function_code ]( 'R', &modbus_rx, &MBSDB, tx_buf );
 			}
@@ -808,19 +789,22 @@ void ModbusSlaveTask( void )
 {
 	static uint16_t old_len = 0;
 	static AppTimerData_ut timerModbusFrame = { 0 };
-	static uint32_t old_BaudRate = 0;
-	static float rtu_frame_time = RTU_FRAME_IDLE_MIN;
 
 	MBS.UpdateInputs();
 
-	// parse completed frame before reading new data, so the next packet starts at rcvd_frame[0]
-	if( AppTimer.IsRun( &timerModbusFrame ) && AppTimer.IsExpired( &timerModbusFrame ) )
+	// receive data, parse frame, response valid data
+	rcvd_len += UART.Read( UART_PLC, &rcvd_frame[ rcvd_len ], sizeof( rcvd_frame ) - rcvd_len );
+
+	if( ( rcvd_len > 0 ) && ( rcvd_len != old_len ) )
+	{
+		AppTimer.Start( &timerModbusFrame, MODBUS_FRAME_IDLE_TIME );
+		old_len = rcvd_len;
+	}
+
+	if( AppTimer.IsExpired( &timerModbusFrame ) )
 	{
 		uint8_t tx_buf[ 512 ];
 		uint16_t tx_len = 0;
-
-		AppTimer.Stop( &timerModbusFrame );
-
 		tx_len = MBS.Run( rcvd_frame, rcvd_len, tx_buf );
 
 		if( tx_len )
@@ -832,26 +816,6 @@ void ModbusSlaveTask( void )
 		rcvd_len = 0;
 		old_len = 0;
 		UART.PORT[ UART_PLC ]->stat.received = 0;
-	}
-
-	// receive data for the current frame
-	rcvd_len += UART.Read( UART_PLC, &rcvd_frame[ rcvd_len ], sizeof( rcvd_frame ) - rcvd_len );
-
-	if( ( rcvd_len > 0 ) && ( rcvd_len != old_len ) )
-	{
-		if( old_BaudRate !=  UART.PORT[ UART_PLC ]->handle->Init.BaudRate )
-		{
-			old_BaudRate =  UART.PORT[ UART_PLC ]->handle->Init.BaudRate;
-			rtu_frame_time = RTU_FRAME_IDLE_MIN;
-
-			if( old_BaudRate <= 19200 )
-			{
-				rtu_frame_time = MAX_BITS_PER_CHAR / old_BaudRate * RTU_FRAME_IDLE_CHAR * SAFETY_FACTOR;
-			}
-		}
-
-		AppTimer.Start( &timerModbusFrame, rtu_frame_time );
-		old_len = rcvd_len;
 	}
 
 	MBS.UpdateFromHoldings();

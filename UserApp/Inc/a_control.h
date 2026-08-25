@@ -58,11 +58,26 @@ typedef union fault_status_union_Tag
 	uint16_t All;
 } loop_fault_status_ut;
 
+typedef enum pid_control_direction_enum_Tag
+{
+	PID_DIRECTION_HEATING = 0,
+	PID_DIRECTION_COOLING = 1,
+} pid_control_direction_et;
+
+typedef enum pid_control_region_enum_Tag
+{
+	PID_REGION_FAR = 0,
+	PID_REGION_NEAR = 1,
+} pid_control_region_et;
+
 typedef struct pid_parameter_status_struct_Tag
 {
 	uint16_t EffectivePb;
 	uint16_t EffectiveTi;
 	uint16_t EffectiveTd;
+	int16_t EffectiveInputFilterCoeff;
+	pid_control_direction_et Direction;
+	pid_control_region_et Region;
 	bool Pending;
 } pid_parameter_status_st;
 

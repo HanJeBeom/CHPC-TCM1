@@ -162,13 +162,12 @@ static AppTimerData_ut tf_get_hb_timer = { .All = 0 };
 static const char tf_log_csv_header[] =
 	"timestamp_ms,sample_seq,usb_dropped_count,system_run,system_ready,cl1_enable,input_type,input_channel,"
 	"output_type,output_channel,control_period_ms,configured_pb_tenth_pct,configured_ti_100ms,configured_td_10ms,"
-	"effective_pb_tenth_pct,effective_ti_100ms,effective_td_10ms,pid_params_pending,"
-	"output_min_permille,output_max_permille,control_type_u16,cool_heat_mode_u16,output_delay_s,start_delay_s,"
-	"rtd_ch1_mdegc,rtd_ch2_mdegc,smps_id,sv_mdegc,pv_mdegc,error_mdegc,mv_permille,ctrl_fault_u16,"
-	"smps_read_seq_u32,smps_data_age_ms,smps_power_cmd_w,smps_status_u16,"
-	"smps_warning_u16,smps_fault_u16,smps_leak_ch1_q7,smps_leak_ch2_q7,"
-	"smps_leak_ch3_q7,smps_leak_ch4_q7,smps_current_ch1_q7,smps_current_ch2_q7,"
-	"smps_current_ch3_q7,smps_current_ch4_q7,smps_voltage_q5,smps_power_measured_w\r\n";
+	"configured_input_filter_coeff_raw,effective_pb_tenth_pct,effective_ti_100ms,effective_td_10ms,"
+	"effective_input_filter_coeff_raw,pid_params_pending,control_direction_u16,pid_region_u16,"
+	"output_min_permille,output_max_permille,control_type_u16,cool_heat_mode_u16,"
+	"rtd_ch1_mdegc,rtd_ch2_mdegc,sv_mdegc,pv_mdegc,error_mdegc,mv_permille,ctrl_fault_u16,"
+	"smps_data_age_ms,smps_power_cmd_w,smps_status_u16,smps_warning_u16,smps_fault_u16,"
+	"smps_voltage_q5,smps_power_measured_w\r\n";
 static CCMRAM char tf_log_line[ TF_LOG_LINE_MAX ];
 
 /*****************************************************************************/
@@ -1177,7 +1176,7 @@ static void tf_cmd_log( const char * s )
 }
 
 /******************************************************************************
- * @brief Capture and enqueue one 48-column CSV snapshot.
+ * @brief Capture and enqueue one 40-column CSV snapshot.
  *****************************************************************************/
 static void tf_log_stream_task( void )
 {
@@ -1218,10 +1217,10 @@ static void tf_log_stream_task( void )
 
 	int n = snprintf( tf_log_line, sizeof( tf_log_line ),
 		"%lu,%lu,%lu,%u,%u,%u,%u,%d,%u,%d,"
-		"%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,"
-		"%ld,%ld,%u,%ld,%ld,%ld,%ld,%u,"
-		"%lu,%lu,%d,%u,%u,%u,"
-		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u\r\n",
+		"%u,%u,%u,%u,%d,%u,%u,%u,%d,%u,%u,%u,%d,%d,%u,%u,"
+		"%ld,%ld,%ld,%ld,%ld,%ld,%u,"
+		"%lu,%d,%u,%u,%u,"
+		"%d,%u\r\n",
 		( unsigned long )HAL_GetTick(),
 		( unsigned long )seq,
 		( unsigned long )tf.log.usb_dropped_count,
@@ -1236,38 +1235,30 @@ static void tf_log_stream_task( void )
 		( unsigned int )pCfg->Pb,
 		( unsigned int )pCfg->Ti,
 		( unsigned int )pCfg->Td,
+		( int )pCfg->InputFilterCoeff,
 		( unsigned int )pid_status.EffectivePb,
 		( unsigned int )pid_status.EffectiveTi,
 		( unsigned int )pid_status.EffectiveTd,
+		( int )pid_status.EffectiveInputFilterCoeff,
 		( unsigned int )pid_status.Pending,
+		( unsigned int )pid_status.Direction,
+		( unsigned int )pid_status.Region,
 		( int )pCfg->OutputMin,
 		( int )pCfg->OutputMax,
 		( unsigned int )pCfg->ControlType,
 		( unsigned int )pCfg->CoolHeat,
-		( unsigned int )pCfg->OutputDelay,
-		( unsigned int )pCfg->StartDelay,
 		( long )rtd_ch1_mdegc,
 		( long )rtd_ch2_mdegc,
-		( unsigned int )smps_id,
 		( long )sv,
 		( long )pv,
 		( long )error,
 		( long )mv_permille,
 		( unsigned int )Controller.GetFault( 0 ).All,
-		( unsigned long )ModbusMasterGetReadSequence( smps_id ),
 		( unsigned long )ModbusMasterGetDataAgeMs( smps_id ),
 		( int )( int16_t )wr[ MBM_HR_CHPP_8021_OUTPUT_POWER ],
 		( unsigned int )rd[ MBM_HR_CHPP_8021_STATUS_OF_SMPS ],
 		( unsigned int )rd[ MBM_HR_CHPP_8021_WARNING_STATUS_OF_SMPS ],
 		( unsigned int )rd[ MBM_HR_CHPP_8021_FAULT_STATUS_OF_SMPS ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH1_LEAKAGE_CURRENT ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH2_LEAKAGE_CURRENT ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH3_LEAKAGE_CURRENT ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH4_LEAKAGE_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH1_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH2_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH3_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH4_OUTPUT_CURRENT ],
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_OUTPUT_VOLTAGE_MEASURED ],
 		( unsigned int )rd[ MBM_HR_CHPP_8021_OUTPUT_POWER_MEASURED ] );
 

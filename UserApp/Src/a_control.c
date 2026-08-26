@@ -39,6 +39,10 @@
 
 #define ERROR_VALUE_I_TERM_WINDING 40.0f
 
+#define PID_NEAR_ENTER_ERROR_K 1.0f
+#define PID_NEAR_EXIT_ERROR_K 1.3f
+#define PID_HEATING_NEAR_TI_RAW 1200
+
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
 /*****************************************************************************/
@@ -60,6 +64,18 @@ typedef struct control_loop_instance_Tag
 	float lastFilteredSV;
 	float oldFilteredSV;
 	float filter_alpha;
+	int32_t directionSV;
+	bool directionInited;
+	enum
+	{
+		PID_DIRECTION_HEATING = 0,
+		PID_DIRECTION_COOLING
+	} Direction;
+	enum
+	{
+		PID_REGION_FAR = 0,
+		PID_REGION_NEAR
+	} Region;
 	struct
 	{
 		float Ku;
@@ -128,7 +144,8 @@ static void autotune_relay_method( control_loop_config_st *pCfg, control_loop_in
 
 
 static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *pCfg );
-static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg );
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg, uint16_t effective_ti_raw );
+static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
@@ -280,6 +297,8 @@ void ControllerTask( void )
 		else
 		{
 			PID_instance_Init( &pid_inst[ loop_idx ], pCfg );
+			pInst->directionInited = false;
+			pInst->Region = PID_REGION_FAR;
 			pInst->MV = 0;
 			pInst->IntegralSum = 0;
 			pInst->lastError = 0;
@@ -578,8 +597,16 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		}
 		else
 		{
+			PID_update_operating_state( pInst, pCfg );
+
+			uint16_t effective_ti_raw = pCfg->Ti;
+			if( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( PID_REGION_NEAR == pInst->Region ) )
+			{
+				effective_ti_raw = PID_HEATING_NEAR_TI_RAW;
+			}
+
 			/* Apply PB/Ti/Td written by the PLC without requiring CL Disable. */
-			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg );
+			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg, effective_ti_raw );
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
 			pInst->MV = PID2DOF_Calculate_backward_euler( &pid_inst[ pInst->CH ], sp, pv, pCfg->CoolHeat );
@@ -587,6 +614,45 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		}
 	}
 	return retval;
+}
+
+/******************************************************************************
+ * @brief Latch the SV-change direction and update the FAR/NEAR region.
+ *
+ * Direction changes only when SV changes.  Region uses separate enter/exit
+ * thresholds so measurement noise cannot repeatedly switch the effective Ti.
+ ******************************************************************************/
+static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg )
+{
+	if( !pInst || !pCfg ) return;
+
+	if( !pInst->directionInited )
+	{
+		/* Equality defaults to the unchanged path; only a positive demand enables the heating override. */
+		pInst->Direction = ( pCfg->SV > pInst->PV ) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
+		pInst->directionSV = pCfg->SV;
+		pInst->Region = PID_REGION_FAR;
+		pInst->directionInited = true;
+	}
+	else if( pCfg->SV != pInst->directionSV )
+	{
+		pInst->Direction = ( pCfg->SV > pInst->directionSV ) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
+		pInst->directionSV = pCfg->SV;
+		pInst->Region = PID_REGION_FAR;
+	}
+
+	const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
+	if( PID_REGION_FAR == pInst->Region )
+	{
+		if( abs_error <= PID_NEAR_ENTER_ERROR_K )
+		{
+			pInst->Region = PID_REGION_NEAR;
+		}
+	}
+	else if( abs_error >= PID_NEAR_EXIT_ERROR_K )
+	{
+		pInst->Region = PID_REGION_FAR;
+	}
 }
 
 /******************************************************************************
@@ -808,12 +874,12 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
  * setpoint/PV history.  When Ti is set to zero, clear the accumulated integral
  * because integral action has explicitly been disabled.
  ******************************************************************************/
-static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg )
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg, uint16_t effective_ti_raw )
 {
 	if( !pPid || !pCfg ) return;
 
 	const float kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
-	const float ti = pCfg->Ti * MULTIPLY_Ti_INT_TO_FLOAT;
+	const float ti = effective_ti_raw * MULTIPLY_Ti_INT_TO_FLOAT;
 	const float td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;
 
 	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) ) return;
@@ -829,6 +895,11 @@ static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_conf
 	}
 
 	/* Keep the derived values coherent for the alternate PID implementation. */
+	const float a = 2.0f * pPid->Ti / pPid->Ts;
+	pPid->b0 = 1.0f + ( 1.0f - pPid->alpha ) * a;
+	pPid->b1 = 1.0f - ( 1.0f - pPid->alpha ) * a;
+	pPid->c0 = 1.0f + a;
+	pPid->c1 = 1.0f - a;
 	pPid->p0 = ( 2.0f * pPid->Kp * pPid->Td ) / pPid->Ts;
 	pPid->b = ( 2.0f * pPid->lambda * pPid->Td ) / pPid->Ts;
 }

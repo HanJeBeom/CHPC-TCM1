@@ -167,7 +167,10 @@ static const char tf_log_csv_header[] =
 	"smps_read_seq_u32,smps_data_age_ms,smps_power_cmd_w,smps_status_u16,"
 	"smps_warning_u16,smps_fault_u16,smps_leak_ch1_q7,smps_leak_ch2_q7,"
 	"smps_leak_ch3_q7,smps_leak_ch4_q7,smps_current_ch1_q7,smps_current_ch2_q7,"
-	"smps_current_ch3_q7,smps_current_ch4_q7,smps_voltage_q5,smps_power_measured_w\r\n";
+	"smps_current_ch3_q7,smps_current_ch4_q7,smps_voltage_q5,smps_power_measured_w,"
+	"configured_input_filter_coeff_raw,effective_pb_tenth_pct,effective_ti_100ms,effective_td_10ms,"
+	"effective_input_filter_coeff_raw,pid_params_pending,control_direction_u16,pid_region_u16,"
+	"pid_mv_calculated_permille,pid_mv_applied_permille,cooling_reverse_heat_allowed\r\n";
 static CCMRAM char tf_log_line[ TF_LOG_LINE_MAX ];
 
 /*****************************************************************************/
@@ -1194,7 +1197,9 @@ static void tf_log_stream_task( void )
 	}
 
 	const control_loop_config_st * const pCfg = Controller.GetConfig( 0 );
-	if( ( NULL == pCfg ) || ( tf.log.smps_id >= MAX_SMPS_ID ) )
+	pid_diagnostic_status_st pid_status = { 0 };
+	if( ( NULL == pCfg ) || !Controller.GetPidDiagnosticStatus( 0, &pid_status )
+		|| ( tf.log.smps_id >= MAX_SMPS_ID ) )
 	{
 		tf.log.on = false;
 		AppTimer.Stop( &tf_log_timer );
@@ -1218,7 +1223,8 @@ static void tf_log_stream_task( void )
 		"%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,"
 		"%ld,%ld,%u,%ld,%ld,%ld,%ld,%u,"
 		"%lu,%lu,%d,%u,%u,%u,"
-		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u\r\n",
+		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u,"
+		"%d,%u,%u,%u,%d,%u,%u,%u,%ld,%ld,%u\r\n",
 		( unsigned long )HAL_GetTick(),
 		( unsigned long )seq,
 		( unsigned long )tf.log.usb_dropped_count,
@@ -1262,7 +1268,18 @@ static void tf_log_stream_task( void )
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH3_OUTPUT_CURRENT ],
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH4_OUTPUT_CURRENT ],
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_OUTPUT_VOLTAGE_MEASURED ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_OUTPUT_POWER_MEASURED ] );
+		( unsigned int )rd[ MBM_HR_CHPP_8021_OUTPUT_POWER_MEASURED ],
+		( int )pCfg->InputFilterCoeff,
+		( unsigned int )pid_status.EffectivePb,
+		( unsigned int )pid_status.EffectiveTi,
+		( unsigned int )pid_status.EffectiveTd,
+		( int )pid_status.EffectiveInputFilterCoeff,
+		( unsigned int )pid_status.Pending,
+		( unsigned int )pid_status.Direction,
+		( unsigned int )pid_status.Region,
+		( long )( pid_status.CalculatedMV * MULTIPLY_FLOAT_TO_PERMIL ),
+		( long )( pid_status.AppliedMV * MULTIPLY_FLOAT_TO_PERMIL ),
+		( unsigned int )pid_status.CoolingReverseHeatAllowed );
 
 	if( ( n <= 0 ) || ( n >= ( int )sizeof( tf_log_line ) )
 		|| ( CDC.Write( ( const uint8_t * )tf_log_line, ( uint32_t )n ) != ( uint32_t )n ) )

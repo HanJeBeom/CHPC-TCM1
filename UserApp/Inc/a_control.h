@@ -58,6 +58,20 @@ typedef union fault_status_union_Tag
 	uint16_t All;
 } loop_fault_status_ut;
 
+typedef struct pid_diagnostic_status_struct_Tag
+{
+	uint16_t EffectivePb;
+	uint16_t EffectiveTi;
+	uint16_t EffectiveTd;
+	int16_t EffectiveInputFilterCoeff;
+	uint16_t Direction;                 // 0=HEATING, 1=COOLING
+	uint16_t Region;                    // 0=FAR, 1=NEAR
+	bool Pending;
+	bool CoolingReverseHeatAllowed;
+	float CalculatedMV;                 // PID result before output constraints
+	float AppliedMV;                    // output after all constraints
+} pid_diagnostic_status_st;
+
 typedef struct controller_struct_Tag
 {
 	int32_t (*GetPV)( int loop_idx );       // @retval -273150 ~ 2000000 (unit 0.001ºC)
@@ -66,6 +80,7 @@ typedef struct controller_struct_Tag
 	void (*SetFault)( int loop_idx, loop_fault_status_ut flt );
 	void (*SetConfig)( uint16_t data[], int loop_idx );
 	const control_loop_config_st * const (*GetConfig)( int loop_idx );
+	bool (*GetPidDiagnosticStatus)( int loop_idx, pid_diagnostic_status_st *status );
 	void (*ClearAlarm)( uint16_t clear_bitmask_hi, uint16_t clear_bitmask_lo ); // @param clear_bitmask_hi Bitmask to clear fault status of control loop 11th to 20th @param clear_bitmask_lo Bitmask to clear fault status of control loop 1st to 10th
 	void (*SetDefault)( int32_t loop_idx );
 } controller_st;

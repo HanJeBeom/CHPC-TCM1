@@ -161,16 +161,13 @@ static AppTimerData_ut tf_get_hb_timer = { .All = 0 };
 
 static const char tf_log_csv_header[] =
 	"timestamp_ms,sample_seq,usb_dropped_count,system_run,system_ready,cl1_enable,input_type,input_channel,"
-	"output_type,output_channel,control_period_ms,pb_tenth_pct,ti_100ms,td_10ms,"
-	"output_min_permille,output_max_permille,control_type_u16,cool_heat_mode_u16,output_delay_s,start_delay_s,"
-	"rtd_ch1_mdegc,rtd_ch2_mdegc,smps_id,sv_mdegc,pv_mdegc,error_mdegc,mv_permille,ctrl_fault_u16,"
-	"smps_read_seq_u32,smps_data_age_ms,smps_power_cmd_w,smps_status_u16,"
-	"smps_warning_u16,smps_fault_u16,smps_leak_ch1_q7,smps_leak_ch2_q7,"
-	"smps_leak_ch3_q7,smps_leak_ch4_q7,smps_current_ch1_q7,smps_current_ch2_q7,"
-	"smps_current_ch3_q7,smps_current_ch4_q7,smps_voltage_q5,smps_power_measured_w,"
+	"output_type,output_channel,control_period_ms,configured_pb_tenth_pct,configured_ti_100ms,configured_td_10ms,"
 	"configured_input_filter_coeff_raw,effective_pb_tenth_pct,effective_ti_100ms,effective_td_10ms,"
 	"effective_input_filter_coeff_raw,pid_params_pending,control_direction_u16,pid_region_u16,"
-	"pid_mv_calculated_permille,pid_mv_applied_permille,cooling_reverse_heat_allowed\r\n";
+	"output_min_permille,output_max_permille,control_type_u16,cool_heat_mode_u16,"
+	"rtd_ch1_mdegc,rtd_ch2_mdegc,sv_mdegc,pv_mdegc,error_mdegc,"
+	"pid_mv_calculated_permille,pid_mv_applied_permille,cooling_reverse_heat_allowed,ctrl_fault_u16,"
+	"smps_data_age_ms,smps_power_cmd_w,smps_status_u16,smps_warning_u16,smps_fault_u16\r\n";
 static CCMRAM char tf_log_line[ TF_LOG_LINE_MAX ];
 
 /*****************************************************************************/
@@ -1213,18 +1210,15 @@ static void tf_log_stream_task( void )
 	int32_t sv = pCfg->SV;
 	int32_t pv = Controller.GetPV( 0 );
 	int32_t error = sv - pv;
-	int32_t mv_permille = ( int32_t )( Controller.GetMV( 0 ) * MULTIPLY_FLOAT_TO_PERMIL );
 	int32_t rtd_ch1_mdegc = ( int32_t )( Temp.GetTemp( 0 ) * 1000.0f );
 	int32_t rtd_ch2_mdegc = ( int32_t )( Temp.GetTemp( 1 ) * 1000.0f );
 	uint32_t seq = ++tf.log.sample_seq;
 
 	int n = snprintf( tf_log_line, sizeof( tf_log_line ),
 		"%lu,%lu,%lu,%u,%u,%u,%u,%d,%u,%d,"
-		"%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,"
-		"%ld,%ld,%u,%ld,%ld,%ld,%ld,%u,"
-		"%lu,%lu,%d,%u,%u,%u,"
-		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u,"
-		"%d,%u,%u,%u,%d,%u,%u,%u,%ld,%ld,%u\r\n",
+		"%u,%u,%u,%u,%d,%u,%u,%u,%d,%u,"
+		"%u,%u,%d,%d,%u,%u,%ld,%ld,%ld,%ld,"
+		"%ld,%ld,%ld,%u,%u,%lu,%d,%u,%u,%u\r\n",
 		( unsigned long )HAL_GetTick(),
 		( unsigned long )seq,
 		( unsigned long )tf.log.usb_dropped_count,
@@ -1239,36 +1233,6 @@ static void tf_log_stream_task( void )
 		( unsigned int )pCfg->Pb,
 		( unsigned int )pCfg->Ti,
 		( unsigned int )pCfg->Td,
-		( int )pCfg->OutputMin,
-		( int )pCfg->OutputMax,
-		( unsigned int )pCfg->ControlType,
-		( unsigned int )pCfg->CoolHeat,
-		( unsigned int )pCfg->OutputDelay,
-		( unsigned int )pCfg->StartDelay,
-		( long )rtd_ch1_mdegc,
-		( long )rtd_ch2_mdegc,
-		( unsigned int )smps_id,
-		( long )sv,
-		( long )pv,
-		( long )error,
-		( long )mv_permille,
-		( unsigned int )Controller.GetFault( 0 ).All,
-		( unsigned long )ModbusMasterGetReadSequence( smps_id ),
-		( unsigned long )ModbusMasterGetDataAgeMs( smps_id ),
-		( int )( int16_t )wr[ MBM_HR_CHPP_8021_OUTPUT_POWER ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_STATUS_OF_SMPS ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_WARNING_STATUS_OF_SMPS ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_FAULT_STATUS_OF_SMPS ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH1_LEAKAGE_CURRENT ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH2_LEAKAGE_CURRENT ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH3_LEAKAGE_CURRENT ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_CH4_LEAKAGE_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH1_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH2_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH3_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH4_OUTPUT_CURRENT ],
-		( int )( int16_t )rd[ MBM_HR_CHPP_8021_OUTPUT_VOLTAGE_MEASURED ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_OUTPUT_POWER_MEASURED ],
 		( int )pCfg->InputFilterCoeff,
 		( unsigned int )pid_status.EffectivePb,
 		( unsigned int )pid_status.EffectiveTi,
@@ -1277,9 +1241,24 @@ static void tf_log_stream_task( void )
 		( unsigned int )pid_status.Pending,
 		( unsigned int )pid_status.Direction,
 		( unsigned int )pid_status.Region,
+		( int )pCfg->OutputMin,
+		( int )pCfg->OutputMax,
+		( unsigned int )pCfg->ControlType,
+		( unsigned int )pCfg->CoolHeat,
+		( long )rtd_ch1_mdegc,
+		( long )rtd_ch2_mdegc,
+		( long )sv,
+		( long )pv,
+		( long )error,
 		( long )( pid_status.CalculatedMV * MULTIPLY_FLOAT_TO_PERMIL ),
 		( long )( pid_status.AppliedMV * MULTIPLY_FLOAT_TO_PERMIL ),
-		( unsigned int )pid_status.CoolingReverseHeatAllowed );
+		( unsigned int )pid_status.CoolingReverseHeatAllowed,
+		( unsigned int )Controller.GetFault( 0 ).All,
+		( unsigned long )ModbusMasterGetDataAgeMs( smps_id ),
+		( int )( int16_t )wr[ MBM_HR_CHPP_8021_OUTPUT_POWER ],
+		( unsigned int )rd[ MBM_HR_CHPP_8021_STATUS_OF_SMPS ],
+		( unsigned int )rd[ MBM_HR_CHPP_8021_WARNING_STATUS_OF_SMPS ],
+		( unsigned int )rd[ MBM_HR_CHPP_8021_FAULT_STATUS_OF_SMPS ] );
 
 	if( ( n <= 0 ) || ( n >= ( int )sizeof( tf_log_line ) )
 		|| ( CDC.Write( ( const uint8_t * )tf_log_line, ( uint32_t )n ) != ( uint32_t )n ) )

@@ -41,9 +41,10 @@
 
 #define PID_NEAR_ENTER_ERROR_K 1.0f
 #define PID_NEAR_EXIT_ERROR_K 1.3f
-#define PID_HEATING_NEAR_TI_RAW 1200
 #define PID_COOLING_REVERSE_HEAT_ENABLE_ERROR_K 0.3f
 #define PID_COOLING_REVERSE_HEAT_DISABLE_ERROR_K 0.1f
+#define PID_COOLING_MV_RISE_LIMIT_ENABLE_ERROR_K 1.0f
+#define PID_COOLING_MV_MAX_RISE_PER_SECOND 0.02f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -130,6 +131,7 @@ typedef struct {
 	int16_t EffectiveInputFilterCoeff;
 	float CalculatedMV, AppliedMV;
 	bool CoolingReverseHeatAllowed;
+	bool HeatingBumplessPending;
 } pid_st;
 
 
@@ -153,7 +155,8 @@ static void autotune_relay_method( control_loop_config_st *pCfg, control_loop_in
 
 
 static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *pCfg );
-static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg, uint16_t effective_ti_raw );
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg,
+	bool heating_direction );
 static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
 	cool_heat_mode_et cool_heat, bool cooling_direction );
@@ -632,14 +635,9 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		{
 			PID_update_operating_state( pInst, pCfg );
 
-			uint16_t effective_ti_raw = pCfg->Ti;
-			if( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( PID_REGION_NEAR == pInst->Region ) )
-			{
-				effective_ti_raw = PID_HEATING_NEAR_TI_RAW;
-			}
-
 			/* Apply PB/Ti/Td written by the PLC without requiring CL Disable. */
-			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg, effective_ti_raw );
+			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg,
+				PID_DIRECTION_HEATING == pInst->Direction );
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
 			pInst->MV = PID2DOF_Calculate_backward_euler( &pid_inst[ pInst->CH ], sp, pv, pCfg->CoolHeat,
@@ -662,11 +660,13 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 
 	if( !pInst->directionInited )
 	{
-		/* Equality defaults to the unchanged path; only a positive demand enables the heating override. */
+		/* Equality defaults to cooling; direction changes only on a new recipe SV. */
 		pInst->Direction = ( pCfg->SV > pInst->PV ) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
 		pInst->directionSV = pCfg->SV;
 		pInst->Region = PID_REGION_FAR;
 		pid_inst[ pInst->CH ].CoolingReverseHeatAllowed = false;
+		pid_inst[ pInst->CH ].HeatingBumplessPending = false;
+		pid_inst[ pInst->CH ].AppliedMV = 0.0f;
 		pInst->directionInited = true;
 	}
 	else if( pCfg->SV != pInst->directionSV )
@@ -675,6 +675,8 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 		pInst->directionSV = pCfg->SV;
 		pInst->Region = PID_REGION_FAR;
 		pid_inst[ pInst->CH ].CoolingReverseHeatAllowed = false;
+		pid_inst[ pInst->CH ].HeatingBumplessPending = false;
+		pid_inst[ pInst->CH ].AppliedMV = 0.0f;
 	}
 
 	const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
@@ -772,6 +774,17 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 5. 계산된 조작량 (Calculated MV) - 아직 제한 전
 	// 주의: 적분항은 '이전 스텝까지 누적된 값(I)'을 사용합니다.
+	/* When the PLC changes a heating recipe from Ti=0 FAR gains to Ti>0 NEAR
+	 * gains, preload only the integral state so the first output with the new
+	 * gains matches the previously applied MV.  Configured PB/Ti/Td remain
+	 * unchanged and cooling transitions never use this preload. */
+	if( pPID->HeatingBumplessPending )
+	{
+		const float i_preload = pPID->AppliedMV - P_term + ( action * D_term );
+		pPID->I = fmaxf( pPID->u_min, fminf( pPID->u_max, i_preload ) );
+		pPID->HeatingBumplessPending = false;
+	}
+
 	float mv_calc = P_term + pPID->I - ( action * D_term );
 
 	// 6. 출력 제한 (Saturation) 및 실제 조작량 결정
@@ -816,6 +829,19 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	else
 	{
 		pPID->CoolingReverseHeatAllowed = false;
+	}
+
+	/* Near the cooling target, limit only increases in cooling power.  Output
+	 * decreases remain unrestricted so over-cooling can be stopped immediately. */
+	if( cooling_direction && ( COOL_CTRL_MODE == cool_heat )
+		&& ( fabsf( sp - pv ) <= PID_COOLING_MV_RISE_LIMIT_ENABLE_ERROR_K ) )
+	{
+		const float max_mv_increase = PID_COOLING_MV_MAX_RISE_PER_SECOND * Ts;
+		const float max_rising_mv = pPID->AppliedMV + max_mv_increase;
+		if( mv_final > max_rising_mv )
+		{
+			mv_final = max_rising_mv;
+		}
 	}
 
 	pPID->CalculatedMV = mv_calc;
@@ -940,6 +966,7 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->CalculatedMV = 0.0f;
 	pPid->AppliedMV = 0.0f;
 	pPid->CoolingReverseHeatAllowed = false;
+	pPid->HeatingBumplessPending = false;
 }
 
 /******************************************************************************
@@ -953,19 +980,23 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
  * setpoint/PV history.  When Ti is set to zero, clear the accumulated integral
  * because integral action has explicitly been disabled.
  ******************************************************************************/
-static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg, uint16_t effective_ti_raw )
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg,
+	bool heating_direction )
 {
 	if( !pPid || !pCfg ) return;
 
+	const uint16_t previous_ti_raw = pPid->EffectiveTi;
 	const float kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
-	const float ti = effective_ti_raw * MULTIPLY_Ti_INT_TO_FLOAT;
+	const float ti = pCfg->Ti * MULTIPLY_Ti_INT_TO_FLOAT;
 	const float td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;
 	pPid->EffectivePb = pCfg->Pb;
-	pPid->EffectiveTi = effective_ti_raw;
+	pPid->EffectiveTi = pCfg->Ti;
 	pPid->EffectiveTd = pCfg->Td;
 	pPid->EffectiveInputFilterCoeff = ( int16_t )( pPid->alpha * MULTIPLY_FLOAT_TO_PERCENT );
 
 	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) ) return;
+
+	pPid->HeatingBumplessPending = heating_direction && ( 0U == previous_ti_raw ) && ( pCfg->Ti > 0U );
 
 	pPid->Kp = kp;
 	pPid->Ti = ti;
@@ -975,6 +1006,7 @@ static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_conf
 	if( ti <= 0.0f )
 	{
 		pPid->I = 0.0f;
+		pPid->HeatingBumplessPending = false;
 	}
 
 	/* Keep the derived values coherent for the alternate PID implementation. */

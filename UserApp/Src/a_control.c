@@ -46,6 +46,20 @@
 #define PID_COOLING_MV_RISE_LIMIT_ENABLE_ERROR_K 1.0f
 #define PID_COOLING_MV_MAX_RISE_PER_SECOND 0.02f
 
+#define PID_COOLING_CONFIGURED_FAR_PB 6000U
+#define PID_COOLING_CONFIGURED_FAR_TI 0U
+#define PID_COOLING_CONFIGURED_FAR_TD 100U
+#define PID_COOLING_CONFIGURED_NEAR_PB 12000U
+#define PID_COOLING_CONFIGURED_NEAR_TI 2400U
+#define PID_COOLING_CONFIGURED_NEAR_TD 100U
+
+#define PID_COOLING_EFFECTIVE_FAR_PB 20000U
+#define PID_COOLING_EFFECTIVE_FAR_TI 50U
+#define PID_COOLING_EFFECTIVE_FAR_TD 1U
+#define PID_COOLING_EFFECTIVE_NEAR_PB 40000U
+#define PID_COOLING_EFFECTIVE_NEAR_TI 60U
+#define PID_COOLING_EFFECTIVE_NEAR_TD 1U
+
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
 /*****************************************************************************/
@@ -132,6 +146,8 @@ typedef struct {
 	float CalculatedMV, AppliedMV;
 	bool CoolingReverseHeatAllowed;
 	bool HeatingBumplessPending;
+	bool CoolingBumplessPending;
+	bool OutputStateValid;
 } pid_st;
 
 
@@ -666,6 +682,8 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 		pInst->Region = PID_REGION_FAR;
 		pid_inst[ pInst->CH ].CoolingReverseHeatAllowed = false;
 		pid_inst[ pInst->CH ].HeatingBumplessPending = false;
+		pid_inst[ pInst->CH ].CoolingBumplessPending = false;
+		pid_inst[ pInst->CH ].OutputStateValid = false;
 		pid_inst[ pInst->CH ].AppliedMV = 0.0f;
 		pInst->directionInited = true;
 	}
@@ -676,6 +694,9 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 		pInst->Region = PID_REGION_FAR;
 		pid_inst[ pInst->CH ].CoolingReverseHeatAllowed = false;
 		pid_inst[ pInst->CH ].HeatingBumplessPending = false;
+		pid_inst[ pInst->CH ].CoolingBumplessPending = false;
+		pid_inst[ pInst->CH ].OutputStateValid = false;
+		pid_inst[ pInst->CH ].I = 0.0f;
 		pid_inst[ pInst->CH ].AppliedMV = 0.0f;
 	}
 
@@ -774,15 +795,15 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 5. 계산된 조작량 (Calculated MV) - 아직 제한 전
 	// 주의: 적분항은 '이전 스텝까지 누적된 값(I)'을 사용합니다.
-	/* When the PLC changes a heating recipe from Ti=0 FAR gains to Ti>0 NEAR
-	 * gains, preload only the integral state so the first output with the new
-	 * gains matches the previously applied MV.  Configured PB/Ti/Td remain
-	 * unchanged and cooling transitions never use this preload. */
-	if( pPID->HeatingBumplessPending )
+	/* Preserve the previously applied output across a scheduled gain change.
+	 * Heating uses this only for its configured Ti=0 -> Ti>0 transition.
+	 * Cooling uses it in both directions between the internal FAR/NEAR gains. */
+	if( pPID->HeatingBumplessPending || pPID->CoolingBumplessPending )
 	{
 		const float i_preload = pPID->AppliedMV - P_term + ( action * D_term );
 		pPID->I = fmaxf( pPID->u_min, fminf( pPID->u_max, i_preload ) );
 		pPID->HeatingBumplessPending = false;
+		pPID->CoolingBumplessPending = false;
 	}
 
 	float mv_calc = P_term + pPID->I - ( action * D_term );
@@ -846,6 +867,7 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	pPID->CalculatedMV = mv_calc;
 	pPID->AppliedMV = mv_final;
+	pPID->OutputStateValid = true;
 
 	// 7. 적분항 anti-windup 업데이트 (Back-calculation)
 	// 수식: I[k+1] = I[k] + (Ki * error * Ts) + (Kb * (mv_final - mv_calc) * Ts)
@@ -967,6 +989,8 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->AppliedMV = 0.0f;
 	pPid->CoolingReverseHeatAllowed = false;
 	pPid->HeatingBumplessPending = false;
+	pPid->CoolingBumplessPending = false;
+	pPid->OutputStateValid = false;
 }
 
 /******************************************************************************
@@ -985,18 +1009,57 @@ static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_conf
 {
 	if( !pPid || !pCfg ) return;
 
+	const uint16_t previous_pb_raw = pPid->EffectivePb;
 	const uint16_t previous_ti_raw = pPid->EffectiveTi;
-	const float kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
-	const float ti = pCfg->Ti * MULTIPLY_Ti_INT_TO_FLOAT;
-	const float td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;
-	pPid->EffectivePb = pCfg->Pb;
-	pPid->EffectiveTi = pCfg->Ti;
-	pPid->EffectiveTd = pCfg->Td;
+	const uint16_t previous_td_raw = pPid->EffectiveTd;
+	uint16_t effective_pb_raw = pCfg->Pb;
+	uint16_t effective_ti_raw = pCfg->Ti;
+	uint16_t effective_td_raw = pCfg->Td;
+
+	if( !heating_direction && ( COOL_CTRL_MODE == pCfg->CoolHeat ) )
+	{
+		const bool configured_far =
+			( PID_COOLING_CONFIGURED_FAR_PB == pCfg->Pb )
+			&& ( PID_COOLING_CONFIGURED_FAR_TI == pCfg->Ti )
+			&& ( PID_COOLING_CONFIGURED_FAR_TD == pCfg->Td );
+		const bool configured_near =
+			( PID_COOLING_CONFIGURED_NEAR_PB == pCfg->Pb )
+			&& ( PID_COOLING_CONFIGURED_NEAR_TI == pCfg->Ti )
+			&& ( PID_COOLING_CONFIGURED_NEAR_TD == pCfg->Td );
+
+		if( configured_far )
+		{
+			effective_pb_raw = PID_COOLING_EFFECTIVE_FAR_PB;
+			effective_ti_raw = PID_COOLING_EFFECTIVE_FAR_TI;
+			effective_td_raw = PID_COOLING_EFFECTIVE_FAR_TD;
+		}
+		else if( configured_near )
+		{
+			effective_pb_raw = PID_COOLING_EFFECTIVE_NEAR_PB;
+			effective_ti_raw = PID_COOLING_EFFECTIVE_NEAR_TI;
+			effective_td_raw = PID_COOLING_EFFECTIVE_NEAR_TD;
+		}
+	}
+
+	const float kp = effective_pb_raw
+		? ( 100.0f / ( effective_pb_raw * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
+	const float ti = effective_ti_raw * MULTIPLY_Ti_INT_TO_FLOAT;
+	const float td = effective_td_raw * MULTIPLY_Td_INT_TO_FLOAT;
+	pPid->EffectivePb = effective_pb_raw;
+	pPid->EffectiveTi = effective_ti_raw;
+	pPid->EffectiveTd = effective_td_raw;
 	pPid->EffectiveInputFilterCoeff = ( int16_t )( pPid->alpha * MULTIPLY_FLOAT_TO_PERCENT );
 
 	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) ) return;
 
-	pPid->HeatingBumplessPending = heating_direction && ( 0U == previous_ti_raw ) && ( pCfg->Ti > 0U );
+	const bool effective_gains_changed =
+		( previous_pb_raw != effective_pb_raw )
+		|| ( previous_ti_raw != effective_ti_raw )
+		|| ( previous_td_raw != effective_td_raw );
+	pPid->HeatingBumplessPending = heating_direction
+		&& ( 0U == previous_ti_raw ) && ( effective_ti_raw > 0U );
+	pPid->CoolingBumplessPending = !heating_direction
+		&& pPid->OutputStateValid && effective_gains_changed;
 
 	pPid->Kp = kp;
 	pPid->Ti = ti;
@@ -1007,6 +1070,7 @@ static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_conf
 	{
 		pPid->I = 0.0f;
 		pPid->HeatingBumplessPending = false;
+		pPid->CoolingBumplessPending = false;
 	}
 
 	/* Keep the derived values coherent for the alternate PID implementation. */

@@ -797,7 +797,8 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	// 주의: 적분항은 '이전 스텝까지 누적된 값(I)'을 사용합니다.
 	/* Preserve the previously applied output across a scheduled gain change.
 	 * Heating uses this only for its configured Ti=0 -> Ti>0 transition.
-	 * Cooling uses it in both directions between the internal FAR/NEAR gains. */
+	 * Cooling skips preload when enabling integral from Ti=0 so the output can
+	 * fall with the new NEAR P/D terms before stored cooling causes undershoot. */
 	if( pPID->HeatingBumplessPending || pPID->CoolingBumplessPending )
 	{
 		const float i_preload = pPID->AppliedMV - P_term + ( action * D_term );
@@ -1059,7 +1060,8 @@ static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_conf
 	pPid->HeatingBumplessPending = heating_direction
 		&& ( 0U == previous_ti_raw ) && ( effective_ti_raw > 0U );
 	pPid->CoolingBumplessPending = !heating_direction
-		&& pPid->OutputStateValid && effective_gains_changed;
+		&& pPid->OutputStateValid && effective_gains_changed
+		&& !( ( 0U == previous_ti_raw ) && ( effective_ti_raw > 0U ) );
 
 	pPid->Kp = kp;
 	pPid->Ti = ti;

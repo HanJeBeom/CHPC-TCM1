@@ -15,9 +15,9 @@ PID 펌웨어 수정 계획
 
 1.1 펌웨어 기준
 
-- 장비 시험 결과 기준은 7차 상태이며, 7차는 FAR 과적분과 후반 진동은 해결했지만 최저 PV 19.261℃로 언더슈트 기준에 실패했다.
-- 현재 작업 소스와 Debug 빌드 산출물에는 7차를 유지하면서 냉각 NEAR effective Ti를 60초로 늘린 8차가 적용되어 있으며 장비 시험 전 상태이다.
-- 구 5차 적분 데드밴드 시제품은 제거했으며 새 계획의 9차 후보로만 남겨 두었다.
+- 장비 시험 결과 기준은 8차 상태이며, 8차는 20℃ 통과 출력을 낮췄지만 최저 PV 19.347℃로 언더슈트 기준에 실패했다.
+- 현재 작업 소스와 Debug 빌드 산출물에는 8차 계수를 유지하면서 냉각 Ti=0 -> Ti>0 전환의 bumpless preload를 생략한 9차가 적용되어 있으며 장비 시험 전 상태이다.
+- 구 5차 적분 데드밴드 시제품은 제거했으며 새 계획의 10차 후보로만 남겨 두었다.
 
 유지:
 
@@ -31,7 +31,7 @@ PID 펌웨어 수정 계획
 
 - COOLING의 PLC configured FAR 6000/0/100을 effective 20000/0/1로 치환
 - COOLING의 PLC configured NEAR 12000/2400/100을 effective 40000/600/1로 치환
-- COOLING FAR <-> NEAR 유효 계수 전환 시 직전 Applied MV 기준 양방향 bumpless 적분 preload
+- COOLING FAR(Ti=0) -> NEAR(Ti>0) 전환에서는 bumpless I preload를 생략하고 I=0에서 NEAR를 시작
 - 최초 냉각 계산 전에는 유효한 이전 출력이 없으므로 bumpless preload를 수행하지 않는 보호 상태
 - 위 치환은 COOL_CTRL_MODE이면서 COOLING 방향일 때만 적용
 - COOLING FAR에서는 Ti=0으로 I를 사용하지 않고 P항에 따라 냉각 출력을 목표 접근 중 자연스럽게 감소
@@ -458,7 +458,80 @@ PLC 설정:
 - 루트 EXEC는 사용자 승인 전까지 갱신하지 않았다.
 
 
-3.6 9차 수정 후보: 냉각 NEAR 적분 데드밴드
+8차 실제 결과 및 실패 판단:
+
+- NEAR 진입 출력은 5.2%로 7차와 같았다.
+- 최초 20℃ 통과 출력은 3.9%로 7차의 8.6%보다 낮아져 NEAR 적분 완화 효과는 확인됐다.
+- 최저 PV는 19.347℃로 7차보다 0.086℃만 개선됐으며 19.75℃ 기준에는 미달했다.
+- FAR -> NEAR bumpless가 직전 5.2% 출력을 유지하기 위해 약 2.6%의 I를 preload했다.
+- Ti=60초 때문에 언더슈트 후 preload I 해소도 느려져 PV 19.347℃에서 냉각 출력 약 1.0%가 남았다.
+- 마지막 60초 PV P-P는 0.040℃, 평균 PV는 19.9955℃, Applied MV는 0.1~0.2%로 후반 안정성은 유지됐다.
+- fault 및 usb drop은 없었다.
+- 따라서 8차 계수는 유지하고 냉각 FAR(Ti=0) -> NEAR(Ti>0) 전환 preload만 생략하는 9차를 진행한다.
+
+
+3.6 9차 수정: 냉각 FAR -> NEAR bumpless preload 생략
+
+목적:
+
+- FAR -> NEAR 전환에서 직전 FAR 출력 5.2%를 유지하기 위해 약 2.6%의 I가 새로 생성되는 것을 막는다.
+- NEAR를 I=0과 새로운 P/D 출력으로 시작하여 열관성에 대비한 냉각 감속을 허용한다.
+- 8차의 FAR 출력 감소, NEAR Ti=60초 및 후반 작은 연속 냉각 바이어스는 유지한다.
+
+적용 조건:
+
+- 운전 방향이 COOLING이다.
+- 이전 effective Ti가 0이다.
+- 새로운 effective Ti가 0보다 크다.
+- 현재 프로파일에서는 FAR 20000/0/1 -> NEAR 40000/600/1 전환에 해당한다.
+
+동작:
+
+- 위 조건에서는 CoolingBumplessPending을 설정하지 않는다.
+- FAR에서 Ti=0으로 유지된 I=0을 그대로 사용하여 NEAR 첫 출력을 새 P/D항으로 계산한다.
+- NEAR 첫 계산 이후에는 Ti=60초의 기존 오차 적분과 back-calculation을 정상적으로 수행한다.
+- HEATING Ti=0 -> Ti>0 bumpless preload는 변경하지 않는다.
+- PB/Ti/Td, 역가열 차단, 2%/s 제한, SMPS 변환식, PLC 값과 CSV 40열은 변경하지 않는다.
+
+예상 동작:
+
+- NEAR 진입 시 Applied MV가 8차의 약 5.2%에서 새로운 NEAR P/D 기준 약 2.6%로 감소한다.
+- 최초 20℃ 통과 시 Applied MV와 저장 냉각 에너지가 감소하여 최저 PV가 19.75℃ 이상으로 개선되는 것을 목표로 한다.
+- 정상상태에서는 NEAR I가 필요한 0.1~0.5% 냉각 바이어스를 천천히 학습한다.
+
+9차 시험 확인값:
+
+- FAR -> NEAR 전환 직전과 직후 Applied MV 및 변화량
+- NEAR 진입 첫 Calculated MV와 Applied MV
+- 최초 20℃ 통과 시 Applied MV
+- 최저 PV와 19.75℃ 미만 지속시간
+- 21℃ 및 20℃ 도달시간
+- 후반 300초 PV P-P, 평균 PV, Applied MV 평균 및 0% 횟수
+- HEATING FAR -> NEAR bumpless가 기존처럼 유지되는가
+- fault 및 usb_dropped_count
+
+9차 판정:
+
+- 최저 PV가 19.75℃ 이상이어야 한다.
+- NEAR 진입 첫 Applied MV가 8차의 5.2%보다 명확히 낮아야 한다.
+- 의도된 출력 감소 외에 반복적인 FAR/NEAR 출력 급변이 없어야 한다.
+- 후반 300초 PV P-P가 0.15℃ 이하이고 평균 PV 편차가 ±0.10℃ 이내여야 한다.
+- 작은 연속 냉각 바이어스가 형성되고 반복적인 0% 냉각 펄스가 없어야 한다.
+
+9차 구현 및 빌드 기록:
+
+- 구현일: 2026-08-27
+- 구현 파일: UserApp/Src/a_control.c
+- COOLING에서 previous Ti=0, new Ti>0인 계수 전환은 CoolingBumplessPending 대상에서 제외했다.
+- HEATING bumpless 조건은 변경하지 않았다.
+- Debug main-build 성공: text 185180, data 26712, bss 30624 bytes
+- Debug/CHPC-TCM1.hex: 596110 bytes
+- SHA-256: 8AB0FD4E250222B002011463EDCB81535B0EAB538076B20A97158D9ACAB192D5
+- 기존 미사용 PID 함수 3건의 컴파일 경고만 있으며 새 오류는 없다.
+- 루트 EXEC는 사용자 승인 전까지 갱신하지 않았다.
+
+
+3.7 10차 수정 후보: 냉각 NEAR 적분 데드밴드
 
 진행 조건:
 
@@ -473,11 +546,11 @@ PLC 설정:
 - PB/Ti/Td, 역가열 차단, 출력 증가율 및 SMPS 변환식은 동시에 변경하지 않는다.
 
 
-3.7 10차 수정 후보: neutral 출력 전용 anti-windup
+3.8 11차 수정 후보: neutral 출력 전용 anti-windup
 
 진행 조건:
 
-- 9차 후에도 Calculated MV가 음수가 되고 Applied MV가 0에 반복적으로 붙으면서 진동할 때만 진행한다.
+- 10차 후에도 Calculated MV가 음수가 되고 Applied MV가 0에 반복적으로 붙으면서 진동할 때만 진행한다.
 
 방향:
 
@@ -493,7 +566,7 @@ PLC 설정:
 - 이 단계에서도 다른 로직을 동시에 변경하지 않는다.
 
 
-3.8 11차 수정 후보: 응답속도 최적화
+3.9 12차 수정 후보: 응답속도 최적화
 
 진행 조건:
 
@@ -513,7 +586,7 @@ PLC 설정:
 - 언더슈트와 출력 펄스가 증가하면 직전 설정으로 복귀한다.
 
 
-3.9 12차 수정 후보: Td 최종 선택
+3.10 13차 수정 후보: Td 최종 선택
 
 진행 조건:
 
@@ -540,7 +613,7 @@ PLC 설정:
 
 - 한 시험에서는 한 항목만 변경한다.
 - 5차의 effective P/I/D 변환과 I 바이어스 연속성 및 bumpless는 서로 분리하면 출력 급락 또는 과잉보정이 남으므로 하나의 구조 변경 묶음으로 취급한다.
-- 8차에는 NEAR effective Ti=60초 변경만 추가하고 적분 데드밴드, neutral anti-windup, 출력 증가율 변경 또는 SMPS 변환식 변경을 동시에 적용하지 않는다.
+- 9차에는 냉각 FAR -> NEAR preload 생략만 추가하고 적분 데드밴드, neutral anti-windup, 출력 증가율 변경 또는 SMPS 변환식 변경을 동시에 적용하지 않는다.
 - 명확한 진동이 보이는 시험은 조기 종료하고, 안정적인 후보만 장시간 검증한다.
 - 배관, 밸브, 부하, 로그 주기 및 운전 절차를 동일하게 유지한다.
 - 시험 중 진동이 커져 안전 한계를 위협하면 즉시 Disable한다.
@@ -596,9 +669,9 @@ PLC 설정:
 
 7. 빌드 및 배포
 
-- 현재 제어 소스는 7차 FAR effective Ti=0을 유지하고 NEAR effective Ti를 60초로 늘린 8차 상태이다.
-- 8차에는 NEAR 적분 데드밴드와 neutral 출력 전용 anti-windup을 포함하지 않는다.
-- STM32CubeIDE Debug 빌드로 8차 ELF와 HEX를 생성했다.
+- 현재 제어 소스는 8차 계수를 유지하고 냉각 FAR(Ti=0) -> NEAR(Ti>0) bumpless preload를 생략한 9차 상태이다.
+- 9차에는 NEAR 적분 데드밴드와 neutral 출력 전용 anti-windup을 포함하지 않는다.
+- STM32CubeIDE Debug 빌드로 9차 ELF와 HEX를 생성했다.
 - 오류, 경고, HEX 크기와 SHA-256을 기록한다.
 - 루트 EXEC는 현재 1차 HEX이므로 시험용 HEX와 혼동하지 않는다.
 - 사용자 확인 전에는 루트 EXEC를 교체하지 않는다.
@@ -618,7 +691,7 @@ PLC 설정:
 - 구 5차 적분 데드밴드 시제품 Debug 빌드: 오류 0, 기존 미사용 PID 함수 경고 3
 - 구 5차 적분 데드밴드 시제품 HEX 크기: 594,985 bytes
 - 구 5차 적분 데드밴드 시제품 SHA-256: E87AB9A328F469D6F5962C5E966D4E593DC96008A4AFE525AE6B60061EB21AD7
-- 위 시제품은 현재 계획에서 9차 후보로 이동했으며 새 5차~8차 시험용 HEX가 아니다.
+- 위 시제품은 현재 계획에서 10차 후보로 이동했으며 새 5차~9차 시험용 HEX가 아니다.
 - 5차 냉각 I 바이어스 연속 유지 HEX 크기: 596,065 bytes
 - 5차 SHA-256: B6BA95F8B006C7C059E7D32DA91CD17374EC21E8672CF3598D9F4831472BF5DF
 - 6차 FAR 상한 포화 방향 적분 정지 HEX 크기: 596,425 bytes
@@ -629,4 +702,7 @@ PLC 설정:
 - 7차는 최저 PV 19.261℃로 언더슈트 기준 실패, FAR 출력 감소와 후반 0.061℃ P-P는 확인
 - 8차 NEAR effective Ti=60초 HEX 크기: 596,065 bytes
 - 8차 SHA-256: 73C15D6574814347CD9C24D5A1683DAF6161633C7A0B64CA8C46554739E05C6E
+- 8차는 최초 20℃ 통과 출력 3.9%로 개선됐지만 최저 PV 19.347℃로 언더슈트 기준 실패
+- 9차 냉각 FAR -> NEAR preload 생략 HEX 크기: 596,110 bytes
+- 9차 SHA-256: 8AB0FD4E250222B002011463EDCB81535B0EAB538076B20A97158D9ACAB192D5
 - 루트 EXEC: 1차 SHA-256 9613F2B3A9DCE5BDB7C34DA82D7EEA784D1C5AB3336500F8FA75AFC02DC74BD6 유지

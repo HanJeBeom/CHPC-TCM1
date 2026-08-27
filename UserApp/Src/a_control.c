@@ -45,6 +45,8 @@
 #define PID_COOLING_REVERSE_HEAT_DISABLE_ERROR_K 0.1f
 #define PID_COOLING_MV_RISE_LIMIT_ENABLE_ERROR_K 1.0f
 #define PID_COOLING_MV_MAX_RISE_PER_SECOND 0.02f
+#define PID_COOLING_NEAR_INTEGRAL_HOLD_ERROR_K 0.05f
+#define PID_COOLING_NEAR_INTEGRAL_RESUME_ERROR_K 0.10f
 
 #define PID_COOLING_CONFIGURED_FAR_PB 6000U
 #define PID_COOLING_CONFIGURED_FAR_TI 0U
@@ -147,6 +149,7 @@ typedef struct {
 	bool CoolingReverseHeatAllowed;
 	bool HeatingBumplessPending;
 	bool CoolingBumplessPending;
+	bool CoolingNearIntegralHold;
 	bool OutputStateValid;
 } pid_st;
 
@@ -683,6 +686,7 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 		pid_inst[ pInst->CH ].CoolingReverseHeatAllowed = false;
 		pid_inst[ pInst->CH ].HeatingBumplessPending = false;
 		pid_inst[ pInst->CH ].CoolingBumplessPending = false;
+		pid_inst[ pInst->CH ].CoolingNearIntegralHold = false;
 		pid_inst[ pInst->CH ].OutputStateValid = false;
 		pid_inst[ pInst->CH ].AppliedMV = 0.0f;
 		pInst->directionInited = true;
@@ -695,6 +699,7 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 		pid_inst[ pInst->CH ].CoolingReverseHeatAllowed = false;
 		pid_inst[ pInst->CH ].HeatingBumplessPending = false;
 		pid_inst[ pInst->CH ].CoolingBumplessPending = false;
+		pid_inst[ pInst->CH ].CoolingNearIntegralHold = false;
 		pid_inst[ pInst->CH ].OutputStateValid = false;
 		pid_inst[ pInst->CH ].I = 0.0f;
 		pid_inst[ pInst->CH ].AppliedMV = 0.0f;
@@ -874,7 +879,34 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	// 수식: I[k+1] = I[k] + (Ki * error * Ts) + (Kb * (mv_final - mv_calc) * Ts)
 	// mv_final - mv_calc는 초과된 양(오차)을 의미합니다.
 	float Ki_term = 0.0f;
-	if( Ti > 0.0f )
+	const bool cooling_near_integral_control = cooling_direction
+		&& ( COOL_CTRL_MODE == cool_heat )
+		&& ( PID_COOLING_EFFECTIVE_NEAR_PB == pPID->EffectivePb )
+		&& ( PID_COOLING_EFFECTIVE_NEAR_TI == pPID->EffectiveTi )
+		&& ( PID_COOLING_EFFECTIVE_NEAR_TD == pPID->EffectiveTd );
+	const float abs_error = fabsf( error );
+
+	if( !cooling_near_integral_control )
+	{
+		pPID->CoolingNearIntegralHold = false;
+	}
+	else if( pPID->CoolingNearIntegralHold )
+	{
+		if( abs_error >= PID_COOLING_NEAR_INTEGRAL_RESUME_ERROR_K )
+		{
+			pPID->CoolingNearIntegralHold = false;
+		}
+	}
+	else if( abs_error <= PID_COOLING_NEAR_INTEGRAL_HOLD_ERROR_K )
+	{
+		pPID->CoolingNearIntegralHold = true;
+	}
+
+	/* Preserve the learned cooling bias with separate hold/resume thresholds.
+	 * This prevents error noise near 0.05 K from repeatedly toggling Ki.
+	 * Only error-driven integration is held; output tracking/back-calculation
+	 * below remains active so constrained output cannot wind up the integrator. */
+	if( ( Ti > 0.0f ) && !pPID->CoolingNearIntegralHold )
 	{
 		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
 	}
@@ -991,6 +1023,7 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->CoolingReverseHeatAllowed = false;
 	pPid->HeatingBumplessPending = false;
 	pPid->CoolingBumplessPending = false;
+	pPid->CoolingNearIntegralHold = false;
 	pPid->OutputStateValid = false;
 }
 

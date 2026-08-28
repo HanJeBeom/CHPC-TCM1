@@ -45,8 +45,7 @@
 #define PID_COOLING_REVERSE_HEAT_DISABLE_ERROR_K 0.1f
 #define PID_COOLING_MV_RISE_LIMIT_ENABLE_ERROR_K 1.0f
 #define PID_COOLING_MV_MAX_RISE_PER_SECOND 0.02f
-#define PID_COOLING_NEAR_INTEGRAL_RAMP_START_ERROR_K 0.05f
-#define PID_COOLING_NEAR_INTEGRAL_RAMP_FULL_ERROR_K 0.10f
+#define PID_COOLING_NEAR_INTEGRAL_DEADBAND_K 0.05f
 
 #define PID_COOLING_CONFIGURED_FAR_PB 6000U
 #define PID_COOLING_CONFIGURED_FAR_TI 0U
@@ -876,34 +875,19 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	// 수식: I[k+1] = I[k] + (Ki * error * Ts) + (Kb * (mv_final - mv_calc) * Ts)
 	// mv_final - mv_calc는 초과된 양(오차)을 의미합니다.
 	float Ki_term = 0.0f;
-	const bool cooling_near_integral_control = cooling_direction
+	const bool hold_cooling_near_ki = cooling_direction
 		&& ( COOL_CTRL_MODE == cool_heat )
 		&& ( PID_COOLING_EFFECTIVE_NEAR_PB == pPID->EffectivePb )
 		&& ( PID_COOLING_EFFECTIVE_NEAR_TI == pPID->EffectiveTi )
-		&& ( PID_COOLING_EFFECTIVE_NEAR_TD == pPID->EffectiveTd );
-	const float abs_error = fabsf( error );
-	float ki_scale = 1.0f;
+		&& ( PID_COOLING_EFFECTIVE_NEAR_TD == pPID->EffectiveTd )
+		&& ( fabsf( error ) <= PID_COOLING_NEAR_INTEGRAL_DEADBAND_K );
 
-	if( cooling_near_integral_control )
+	/* Preserve the learned cooling bias inside the NEAR temperature deadband.
+	 * Only error-driven integration is held; output tracking/back-calculation
+	 * below remains active so constrained output cannot wind up the integrator. */
+	if( ( Ti > 0.0f ) && !hold_cooling_near_ki )
 	{
-		if( abs_error <= PID_COOLING_NEAR_INTEGRAL_RAMP_START_ERROR_K )
-		{
-			ki_scale = 0.0f;
-		}
-		else if( abs_error < PID_COOLING_NEAR_INTEGRAL_RAMP_FULL_ERROR_K )
-		{
-			ki_scale = ( abs_error - PID_COOLING_NEAR_INTEGRAL_RAMP_START_ERROR_K )
-				/ ( PID_COOLING_NEAR_INTEGRAL_RAMP_FULL_ERROR_K
-					- PID_COOLING_NEAR_INTEGRAL_RAMP_START_ERROR_K );
-		}
-	}
-
-	/* Fade in error-driven integration between 0.05 K and 0.10 K instead of
-	 * latching it off until a hard resume threshold.  Output tracking and
-	 * back-calculation below remain fully active at every error magnitude. */
-	if( Ti > 0.0f )
-	{
-		Ki_term = ( pPID->Kp / Ti ) * error * Ts * ki_scale;
+		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
 	}
 
 	// Saturation 오차 (실제 출력 - 계산된 출력)

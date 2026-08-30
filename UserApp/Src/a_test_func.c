@@ -27,7 +27,7 @@
 #define TF_TASK_CYCLE_TIME		0.01f	// 10ms line scan
 #define TF_MEAS_PERIOD			0.5f	// continuous measurement stream period
 #define TF_LOG_PERIOD			0.1f	// CL1/CHPP-8021 CSV snapshot period
-#define TF_LOG_COLUMNS			44
+#define TF_LOG_COLUMNS			40
 #define TF_LOG_LINE_MAX		640
 #define TF_CAL_HB_PERIOD		0.5f	// calibration heartbeat event period
 #define TF_GET_SETTLE_TIME		0.5f	// wait for a fresh ADC value after sensor type change
@@ -1176,7 +1176,7 @@ static void tf_cmd_log( const char * s )
 }
 
 /******************************************************************************
- * @brief Capture and enqueue one 44-column CSV snapshot.
+ * @brief Capture and enqueue one 40-column CSV snapshot.
  *****************************************************************************/
 static void tf_log_stream_task( void )
 {

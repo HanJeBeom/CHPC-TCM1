@@ -1180,6 +1180,57 @@ SMPS 출력 변환:
 - 1차에는 후단 출력 제한이 없으므로 pid_mv_calculated_permille은 포화 전 값, pid_mv_applied_permille은 기존 상·하한 포화 후 값을 기록한다.
 - cooling_reverse_heat_allowed는 1차에 해당 기능이 없으므로 0을 기록한다.
 - CSV 헤더와 출력 인자 수를 정적으로 검사하여 정확히 40열임을 확인한다.
+3.22 구조 수정 1단계 - FAR/NEAR 계수 분리와 적분 연속성
+
+문제 근거:
+
+- 1차 냉각 로그에서 내부 Region이 NEAR인 동안에도 PLC configured 계수가 6000/0/100과 12000/2400/100 사이에서 104회 전환됐다.
+- 기존 코드는 PLC Ti=0 수신 시마다 PID 적분값 I를 0으로 초기화해 20℃ 설정에서 약 21℃ 정상상태 오차를 제거하지 못했다.
+- D=0 시험은 가열 후반 진동을 0.903℃ P-P에서 1.121℃ P-P로 악화시켜 D 제거가 해결책이 아님을 확인했다.
+
+1단계 구현:
+
+- PLC가 보내는 Ti=0 프로파일을 FAR, Ti>0 프로파일을 NEAR로 각각 저장한다.
+- configured 값은 PLC 수신값을 그대로 유지하고, effective 값은 펌웨어 내부 FAR/NEAR Region으로만 선택한다.
+- NEAR 중 PLC가 FAR 프로파일을 보내도 저장된 NEAR PB/Ti/Td를 계속 적용한다.
+- Ti=0에서는 P-only 출력으로 계산하되 적분 메모리를 삭제하지 않는다.
+- 적분값은 Disable 및 새 SV 요구 시작에서만 초기화하고 PLC 프로파일 수신만으로 초기화하지 않는다.
+- 가열 NEAR 강제 Ti=1200을 제거하고 PLC NEAR Ti=2400을 적용한다.
+- D=100과 입력 필터 계수 20은 PLC 설정 그대로 유지한다.
+- TF_LOG_COLUMNS 및 주석을 실제 CSV와 동일한 40열로 수정하고 effective 입력 필터 표시는 configured raw 값과 일치시킨다.
+- SMPS 출력 변환, 극성 히스테리시스, 최소출력과 0% 방지는 2단계 이후로 보류한다.
+
+정적/로그 재생 검증:
+
+- CSV 헤더 열 수는 40개이다.
+- 기존 가열 로그 재생에서 configured 전환 3회가 effective 전환 1회로 정리되고 최종 effective는 12000/2400/100이다.
+- 기존 냉각 로그 재생에서 configured 전환 104회가 실제 Region에 따른 effective 전환 7회로 제한된다.
+- NEAR 프로파일 확보 후 NEAR에서 effective Ti=0 적용은 0회이며 최종 effective는 12000/2400/100이다.
+3.23 구조 수정 2단계-A - PID 수식 정정
+
+D=100 2차 시험 근거:
+
+- 가열은 39.9℃ 500.6초, 40℃ 697.6초로 SV 접근이 지나치게 느렸다.
+- 냉각은 20℃에 172.3초에 도달했지만 후반 120초 0.636℃ P-P와 출력 극성 교차 131회를 기록했다.
+- 기존 활성 PID는 InputFilterCoeff를 SV 필터에 사용하고 원시 PV를 D항에 사용해 가열 지연과 냉각 출력 채터링을 만들었다.
+
+2단계-A 구현:
+
+- InputFilterCoeff=20을 SV 필터가 아니라 실제 PV 1차 저역통과 필터로 적용한다.
+- P항과 I항은 실제 SV와 필터된 PV의 오차를 사용한다.
+- D항은 필터된 PV 변화량만 사용하고 설정값 변화에는 미분 킥이 발생하지 않게 한다.
+- Ti를 SV 필터 시정수로 사용하던 기존 결합을 제거한다.
+- 2자유도 형식은 beta=1, gamma=0으로 적용한다.
+- 최초 제어 주기에는 필터 PV와 D 이전 PV를 현재 PV로 초기화해 D 스파이크를 방지한다.
+- FAR/NEAR 프로파일 분리와 적분 연속성은 유지한다.
+- 냉각 최소출력, 역가열 히스테리시스와 SMPS 변환은 이번 수정에 포함하지 않는다.
+
+2단계-A 시험 판정:
+
+- PLC D=100, InputFilterCoeff=20 조건으로 시험한다.
+- 가열 39.9℃ 도달시간, 최고 PV와 후반 P-P를 확인한다.
+- 냉각 20℃ 도달 후 진동 주기, 출력 극성 교차와 후반 P-P를 확인한다.
+- PID 수식 단독 효과를 확인한 뒤에만 냉각 출력 유지 2단계-B를 적용한다.
 
 시험 순서:
 
@@ -1187,6 +1238,54 @@ SMPS 출력 변환:
 2) 40℃ -> 20℃ 냉각에서 21/20℃ 도달, 최저 PV와 마지막 60초 P-P를 확인한다.
 3) 냉각이 SV에는 도달하지만 진동하면 2차 역가열 차단만 다음 후보로 적용한다.
 4) 2차도 0.15℃ P-P를 넘을 때만 3차 2%/s 출력 증가 제한을 별도 검토한다.
+
+3.24 구조 수정 2단계-B - 게인 무충격 전환과 냉각 연속출력
+
+3차 실기 로그 근거:
+
+- 가열은 39℃ 93.7초, 39.9℃ 498.5초이며 724.7초 시험 종료까지 40℃를 통과하지 못했다.
+- 가열 FAR/NEAR 경계에서 Region이 5회 전환됐고 Applied MV가 -22.6%와 -5.7% 사이에서 불연속적으로 바뀌어 초기 큰 진동을 만들었다.
+- 냉각은 20℃ 209.5초 도달 후 약 210~600초 구간에서 30초 P-P 0.036~0.070℃로 안정됐다.
+- 냉각 정상 유지 출력은 약 +0.5~1.0%였으며 약 620초부터 Applied MV가 0%에 닿고 음의 가열 출력으로 반전된 뒤 19.756~20.437℃, 0.681℃ P-P 진동이 발생했다.
+- PID 수식 정정은 냉각 큰 진동 시작을 2차의 약 210초에서 3차의 약 630초로 늦췄으나 SMPS 영점 및 극성 반전 문제는 남았다.
+
+2단계-B 구현:
+
+- 유효 PB/Ti/Td가 FAR/NEAR 사이에서 변경되면 변경 직전 Applied MV와 새 PID 기본 출력의 차이를 임시 전환 바이어스로 설정한다.
+- 전환 첫 샘플은 직전 Applied MV에서 시작하며 전환 바이어스는 8초 시정수로 감쇠시킨다.
+- 전환 바이어스를 장기 I preload로 저장하지 않아 NEAR Ti=240초 때문에 과도 출력이 장시간 유지되는 것을 막는다.
+- 새 SV 요구에서는 이전 요구의 전환 바이어스를 전달하지 않고 I와 전환 상태를 초기화한다.
+- 냉각 방향의 내부 NEAR에서 역가열 비허용 상태이면 Applied MV 하한을 +0.5%(약 5W)로 제한한다.
+- PV <= SV-0.15℃에서만 역가열을 허용하고 PV >= SV-0.05℃로 회복하면 역가열을 다시 차단한다.
+- 최소 냉각 출력에 걸린 동안 I 오차항이 더 낮은 출력 방향으로 누적되지 않도록 조건부 anti-windup을 적용한다.
+- Calculated MV는 제약 전 PID 결과, Applied MV는 최소 냉각 및 포화 제약 후 실제 결과를 기록한다.
+- cooling_reverse_heat_allowed는 고정 0이 아니라 실제 역가열 히스테리시스 상태를 기록한다.
+- PLC configured FAR 6000/0/100, NEAR 12000/2400/100, D=100과 InputFilterCoeff=20은 변경하지 않는다.
+- CSV 형식은 기존 40열을 그대로 유지한다.
+
+4차 시험 판정:
+
+- 가열 FAR/NEAR 전환 첫 샘플의 Applied MV 불연속은 0.5%p 이내여야 한다.
+- 가열 경계 통과 중 전환 바이어스 감쇠에 따라 출력 변화율이 대략 2%p/s 이하인지 확인한다.
+- 가열 최고 PV, 39.9℃ 및 40℃ 도달시간과 90~150초 P-P를 3차와 비교한다.
+- 냉각 NEAR에서 역가열 비허용 중 Applied MV가 +0.5% 아래로 내려가지 않아야 한다.
+- PV가 SV-0.15℃보다 높을 때 출력 극성 반전은 0회여야 한다.
+- 역가열이 허용되면 cooling_reverse_heat_allowed=1, SV-0.05℃까지 회복하면 0으로 복귀해야 한다.
+- 냉각 마지막 300초 PV P-P 0.15℃ 이하, 평균 19.95~20.05℃를 목표로 한다.
+- ctrl_fault, smps_fault, smps_warning 및 usb_dropped_count 증가가 없어야 한다.
+
+2단계-B 빌드 기록:
+
+- 적용 및 빌드일: 2026-08-30
+- STM32CubeIDE 2.2.0 GNU Tools for STM32 14.3.rel1로 컴파일, 링크 및 HEX 생성에 성공했다.
+- 기존 미사용 PID 함수 경고 3건 외에 새 컴파일 경고와 오류는 없다.
+- Debug main-build: text 184868, data 27352, bss 30624 bytes
+- Debug/CHPC-TCM1.elf: 2,168,428 bytes
+- Debug/CHPC-TCM1.elf SHA-256: 45CC8817530778D91E0E08AC8D4017476B441FE66A54F7630E9A02230782841E
+- Debug/CHPC-TCM1.hex: 597,039 bytes
+- Debug/CHPC-TCM1.hex SHA-256: F1E585A089B0AA71E2C5FD362555560A880B14B56B4FF8689288D53466F455D9
+- makefile post-build의 Unix cp만 Windows에서 실패했으며 생성된 HEX를 루트 EXEC에 직접 복사했다.
+- 루트 EXEC는 597,039 bytes, SHA-256 F1E585A089B0AA71E2C5FD362555560A880B14B56B4FF8689288D53466F455D9로 Debug HEX와 일치한다.
 
 
 4. 시험 및 변경 원칙
@@ -1272,11 +1371,11 @@ SMPS 출력 변환:
 
 7. 빌드 및 배포
 
-- 현재 제어 계산은 실제 1차 커밋 ed265af 기준으로 복귀한 상태이다.
-- 1차 이후 제어 로직은 제거했으며 로그만 분석용 40열 CSV 인터페이스를 적용했다.
-- STM32CubeIDE Debug 빌드로 1차 제어 + 40열 CSV ELF와 HEX를 생성했다.
+- 현재 제어는 FAR/NEAR 프로파일 분리·적분 연속성 1단계와 PV 필터 기반 PID 수식 2단계-A를 적용한 상태이다.
+- 출력 제한 계열의 이후 제어 로직은 적용하지 않았으며 분석용 40열 CSV 인터페이스를 유지한다.
+- STM32CubeIDE Debug 빌드로 PID 수식 수정 2단계-A ELF와 HEX를 생성했다.
 - makefile post-build의 cp 실패 후 생성 HEX를 루트 EXEC 파일에 직접 복사했다.
-- 현재 루트 EXEC SHA-256은 FD529447C09FA67E7A053296A0187EACBD9BD43172EB514F9B7370ED893C5756이다.
+- 현재 루트 EXEC SHA-256은 079B80D5C31A9A4C8F569292569AD90899C056752BDD46FB23752407D64264E6이다.
 - 펌웨어 리비전 0x0005는 변경하지 않았다.
 1차 기준 복귀 재빌드 기록:
 
@@ -1308,6 +1407,35 @@ SMPS 출력 변환:
 - makefile post-build의 Unix식 cp는 Windows에서 실패했으나 생성된 HEX를 루트 EXEC에 직접 복사했다.
 - 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 동일하다.
 - 실기 성능은 새 40열 로그로 판정한다.
+구조 수정 1단계 빌드 기록:
+
+- 적용 및 빌드일: 2026-08-30
+- 기준 커밋: 48b9bce fix(control): 1차 PID 제어 복귀 및 40열 CSV 진단 적용
+- CSV 열 수 정적 검사: 40개
+- 기존 로그 재생 검증: 냉각 NEAR 프로파일 확보 후 effective Ti=0 적용 0회
+- 소스 컴파일/링크 및 ELF/HEX 생성 성공: 오류 0, a_control.c 기존 미사용 PID 함수 경고 3건
+- Debug main-build: text 184388, data 26952, bss 30624 bytes
+- Debug/CHPC-TCM1.elf: 2,167,420 bytes
+- Debug/CHPC-TCM1.elf SHA-256: 3EC161DA90E63296A466E3916F790C0226A63C28B24593905B4DFEB689B16EA3
+- Debug/CHPC-TCM1.hex: 594,564 bytes
+- Debug/CHPC-TCM1.hex SHA-256: 16B8A72A42DA8368836BDAE32F98D91587EBE8583B862392795256D676DD5A3F
+- makefile post-build의 Unix식 cp는 Windows에서 실패했으나 생성된 HEX를 루트 EXEC에 직접 복사했다.
+- 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 동일하다.
+- 실기 성능은 새 40열 가열·냉각 로그로 판정한다.
+PID 수식 수정 2단계-A 빌드 기록:
+
+- 적용 및 빌드일: 2026-08-30
+- InputFilterCoeff=20 실제 PV 필터, P/I 실제 SV 오차, D 필터 PV 미분 적용
+- 냉각 출력 유지와 역가열 히스테리시스는 미적용
+- 소스 컴파일/링크 및 ELF/HEX 생성 성공: 오류 0, a_control.c 기존 미사용 PID 함수 경고 3건
+- Debug main-build: text 184396, data 27112, bss 30624 bytes
+- Debug/CHPC-TCM1.elf: 2,167,588 bytes
+- Debug/CHPC-TCM1.elf SHA-256: B4BC863816FA7B23ECE1A68069463EA0B75E6C617F45EA3A0BDC76910BF1239C
+- Debug/CHPC-TCM1.hex: 595,030 bytes
+- Debug/CHPC-TCM1.hex SHA-256: 079B80D5C31A9A4C8F569292569AD90899C056752BDD46FB23752407D64264E6
+- makefile post-build의 Unix식 cp는 Windows에서 실패했으나 생성된 HEX를 루트 EXEC에 직접 복사했다.
+- 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 동일하다.
+- 실기 성능은 새 40열 가열·냉각 로그로 판정한다.
 
 
 

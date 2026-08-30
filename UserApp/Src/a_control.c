@@ -41,11 +41,22 @@
 
 #define PID_NEAR_ENTER_ERROR_K 1.0f
 #define PID_NEAR_EXIT_ERROR_K 1.3f
-#define PID_HEATING_NEAR_TI_RAW 1200
+#define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
+#define PID_COOLING_NEAR_MIN_MV 0.005f
+#define PID_COOLING_REVERSE_HEAT_ENTER_K 0.15f
+#define PID_COOLING_REVERSE_HEAT_EXIT_K 0.05f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
 /*****************************************************************************/
+
+typedef struct pid_gain_profile_struct_Tag
+{
+	uint16_t Pb;
+	uint16_t Ti;
+	uint16_t Td;
+	bool Valid;
+} pid_gain_profile_st;
 
 typedef struct control_loop_instance_Tag
 {
@@ -76,6 +87,8 @@ typedef struct control_loop_instance_Tag
 		PID_REGION_FAR = 0,
 		PID_REGION_NEAR
 	} Region;
+	pid_gain_profile_st FarGains;
+	pid_gain_profile_st NearGains;
 	struct
 	{
 		float Ku;
@@ -116,12 +129,18 @@ typedef struct {
 	// PI integrator
 	float I;
 
-	// Derivative filter
+	// Filtered PV and derivative state
+	float PV_filtered;
 	float p0, b;
 	float v_prev, PV_prev;
+	bool PVFilterInited;
 
 	// Anti-windup gain
 	float Kaw;
+	float GainTransitionBias;
+	float GainTransitionTargetMV;
+	bool GainTransitionPending;
+	bool CoolingReverseHeatAllowed;
 
 	/* Diagnostic mirrors; these fields do not participate in PID calculation. */
 	uint16_t EffectivePb, EffectiveTi, EffectiveTd;
@@ -150,9 +169,13 @@ static void autotune_relay_method( control_loop_config_st *pCfg, control_loop_in
 
 
 static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *pCfg );
-static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg, uint16_t effective_ti_raw );
-static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
-static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg,
+	uint16_t effective_pb_raw, uint16_t effective_ti_raw, uint16_t effective_td_raw );
+static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
+static __RAM_FUNC void PID_cache_gain_profile( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
+static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_loop_instance_st const *pInst );
+static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
+	cool_heat_mode_et cool_heat, bool cooling_near );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
 
@@ -306,6 +329,8 @@ void ControllerTask( void )
 			PID_instance_Init( &pid_inst[ loop_idx ], pCfg );
 			pInst->directionInited = false;
 			pInst->Region = PID_REGION_FAR;
+			pInst->FarGains.Valid = false;
+			pInst->NearGains.Valid = false;
 			pInst->MV = 0;
 			pInst->IntegralSum = 0;
 			pInst->lastError = 0;
@@ -396,14 +421,17 @@ static bool control_loop_get_pid_diagnostic_status( int loop_idx, pid_diagnostic
 
 	const pid_st * const pPid = &pid_inst[ loop_idx ];
 	const control_loop_instance_st * const pInst = &ControllerVars.Inst[ loop_idx ];
+	const control_loop_config_st * const pCfg = &ControllerVars.Cfg[ loop_idx ];
 	status->EffectivePb = pPid->EffectivePb;
 	status->EffectiveTi = pPid->EffectiveTi;
 	status->EffectiveTd = pPid->EffectiveTd;
 	status->EffectiveInputFilterCoeff = pPid->EffectiveInputFilterCoeff;
 	status->Direction = ( uint16_t )pInst->Direction;
 	status->Region = ( uint16_t )pInst->Region;
-	status->Pending = false;
-	status->CoolingReverseHeatAllowed = false;
+	status->Pending = ( pCfg->Pb != pPid->EffectivePb )
+		|| ( pCfg->Ti != pPid->EffectiveTi )
+		|| ( pCfg->Td != pPid->EffectiveTd );
+	status->CoolingReverseHeatAllowed = pPid->CoolingReverseHeatAllowed;
 	status->CalculatedMV = pPid->CalculatedMV;
 	status->AppliedMV = pPid->AppliedMV;
 	return true;
@@ -626,19 +654,34 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		}
 		else
 		{
-			PID_update_operating_state( pInst, pCfg );
-
-			uint16_t effective_ti_raw = pCfg->Ti;
-			if( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( PID_REGION_NEAR == pInst->Region ) )
+			pid_st * const pPid = &pid_inst[ pInst->CH ];
+			const bool setpoint_changed = PID_update_operating_state( pInst, pCfg );
+			if( setpoint_changed )
 			{
-				effective_ti_raw = PID_HEATING_NEAR_TI_RAW;
+				/* A new demand starts with a clean integral; live PLC profile writes do not. */
+				pPid->I = 0.0f;
+				pPid->GainTransitionBias = 0.0f;
+				pPid->GainTransitionPending = false;
+				pPid->CoolingReverseHeatAllowed = false;
 			}
 
-			/* Apply PB/Ti/Td written by the PLC without requiring CL Disable. */
-			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg, effective_ti_raw );
+			PID_cache_gain_profile( pInst, pCfg );
+			const pid_gain_profile_st * const effective = PID_select_gain_profile( pInst );
+			const uint16_t effective_pb = effective ? effective->Pb : pCfg->Pb;
+			const uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
+			const uint16_t effective_td = effective ? effective->Td : pCfg->Td;
+
+			PID_instance_UpdateGains( pPid, pCfg, effective_pb, effective_ti, effective_td );
+			if( setpoint_changed )
+			{
+				/* Do not transfer the old demand's output into a new setpoint. */
+				pPid->GainTransitionPending = false;
+			}
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
-			pInst->MV = PID2DOF_Calculate_backward_euler( &pid_inst[ pInst->CH ], sp, pv, pCfg->CoolHeat );
+			const bool cooling_near = ( PID_DIRECTION_COOLING == pInst->Direction )
+				&& ( PID_REGION_NEAR == pInst->Region );
+			pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat, cooling_near );
 			retval = 1;
 		}
 	}
@@ -651,23 +694,26 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
  * Direction changes only when SV changes.  Region uses separate enter/exit
  * thresholds so measurement noise cannot repeatedly switch the effective Ti.
  ******************************************************************************/
-static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg )
+static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg )
 {
-	if( !pInst || !pCfg ) return;
+	if( !pInst || !pCfg ) return false;
+	bool setpoint_changed = false;
 
 	if( !pInst->directionInited )
 	{
-		/* Equality defaults to the unchanged path; only a positive demand enables the heating override. */
+		/* Equality defaults to cooling; direction is latched from the active demand. */
 		pInst->Direction = ( pCfg->SV > pInst->PV ) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
 		pInst->directionSV = pCfg->SV;
 		pInst->Region = PID_REGION_FAR;
 		pInst->directionInited = true;
+		setpoint_changed = true;
 	}
 	else if( pCfg->SV != pInst->directionSV )
 	{
 		pInst->Direction = ( pCfg->SV > pInst->directionSV ) ? PID_DIRECTION_HEATING : PID_DIRECTION_COOLING;
 		pInst->directionSV = pCfg->SV;
 		pInst->Region = PID_REGION_FAR;
+		setpoint_changed = true;
 	}
 
 	const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
@@ -682,6 +728,37 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
 	{
 		pInst->Region = PID_REGION_FAR;
 	}
+
+	return setpoint_changed;
+}
+
+/******************************************************************************
+ * @brief Cache the two PLC gain profiles without letting each PLC write select
+ *        the active controller. Ti=0 identifies FAR and Ti>0 identifies NEAR.
+ ******************************************************************************/
+static __RAM_FUNC void PID_cache_gain_profile( control_loop_instance_st *pInst, control_loop_config_st const *pCfg )
+{
+	if( !pInst || !pCfg ) return;
+
+	pid_gain_profile_st * const profile = ( pCfg->Ti > 0 ) ? &pInst->NearGains : &pInst->FarGains;
+	profile->Pb = pCfg->Pb;
+	profile->Ti = pCfg->Ti;
+	profile->Td = pCfg->Td;
+	profile->Valid = true;
+}
+
+/******************************************************************************
+ * @brief Select gains only from the internally latched FAR/NEAR region.
+ *        Until the matching PLC profile has been observed, use the current
+ *        configured gains as a temporary fallback.
+ ******************************************************************************/
+static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_loop_instance_st const *pInst )
+{
+	if( !pInst ) return NULL;
+
+	const pid_gain_profile_st * const profile =
+		( PID_REGION_NEAR == pInst->Region ) ? &pInst->NearGains : &pInst->FarGains;
+	return profile->Valid ? profile : NULL;
 }
 
 /******************************************************************************
@@ -692,62 +769,45 @@ static __RAM_FUNC void PID_update_operating_state( control_loop_instance_st *pIn
  * @param pv Process Value (PV)
  * @return Manipulated Value (MV)
  ******************************************************************************/
-static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat )
+static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
+	cool_heat_mode_et cool_heat, bool cooling_near )
 {
 	/****************************************************************************
-	       +-------------+               +-----------------+
-	SV --> |  Filtering  | --> (+) ----> |  P + I element  | ---> (+) --> MV
-	       | using alpha |      ^        +-----------------+       ^
-	       +-------------+      |                                  |
-	                            |    +-------------------------+   |
-	PV -------------------------+--> | Preceding               | --+
-	                                 | Derivative-type element |
-	                                 +-------------------------+
-
-	SV filter : (1+(1-alpha)*Ti*s)/(1+Ti*s)
-	P element : Kp
-	I element : Kp/(Ti*s)
-	Preceding D element : (Kp*Td*s)/(1+lambda*Td*s)
-
-	# Note: The input for the preceding derivative-type element should be PV, not SV-PV.
-	# Typically, lambda values between 0.05 and 0.2 are considered appropriate.
-
-	Reference. OMRON CJ series Instruction manual, 3-518 PID command
+	InputFilterCoeff filters PV only. P and I use the true setpoint error against
+	the filtered PV. D is derivative-on-filtered-PV, so setpoint changes do not
+	create derivative kick. This is the beta=1, gamma=0 form of a 2DOF PID.
 	****************************************************************************/
-
-	// 1. 목표값 필터 (Target Value Filter)
-	// 수식: Y(s)/U(s) = (1 + (1-alpha)Ti*s) / (1 + Ti*s)
-	// 이산화(Backward Euler): out[k] = (Ti * out[k-1] + Ts * sp[k] + (1-alpha)*Ti * (sp[k] - sp[k-1])) / (Ti + Ts)
 
 	float Ti = pPID->Ti;
 	float Ts = pPID->Ts;
 	float alpha = pPID->alpha;
 
-	float SP_ref;
-
-	// Ti가 0이 아닐 때만 계산 (0으로 나누기 방지)
-	if( Ti > 0.0f )
+	/* 1. First-order low-pass filter on the measured PV. Raw 0 bypasses the
+	 * filter; raw 100 follows the current sample directly. */
+	if( !pPID->PVFilterInited )
 	{
-		float numerator = ( Ti * pPID->SP_ref_prev ) + ( Ts * sp ) + ( ( 1.0f - alpha ) * Ti * ( sp - pPID->SP_prev ) );
-		SP_ref = numerator / ( Ti + Ts );
+		pPID->PV_filtered = pv;
+		pPID->PV_prev = pv;
+		pPID->v_prev = 0.0f;
+		pPID->PVFilterInited = true;
+	}
+	else if( ( alpha <= 0.0f ) || ( alpha >= 1.0f ) )
+	{
+		pPID->PV_filtered = pv;
 	}
 	else
 	{
-		SP_ref = sp; // Ti가 0이면 필터 없이 통과
+		pPID->PV_filtered += alpha * ( pv - pPID->PV_filtered );
 	}
 
-	// 2. 오차 계산 (필터링된 SV - 현재 PV)
+	/* 2. P and I use the real SV error; Ti no longer delays the setpoint. */
 	float action = ( COOL_CTRL_MODE == cool_heat ) ? -1.0f : 1.0f;
-	float error = action * ( SP_ref - pv );
+	float error = action * ( sp - pPID->PV_filtered );
 
-	// 3. 비례항 (Proportional)
+	/* 3. Proportional term (2DOF setpoint weight beta=1). */
 	float P_term = pPID->Kp * error;
 
-	// 4. 선행 미분항 (Derivative on PV)
-	// e[k] - e[k-1]이 아닌 PV[k] - PV[k-1]을 이용함
-	// 수식: Y(s)/U(s) = (Kp * Td * s) / (1 + lambda * Td * s), 입력 U는 PV
-	// 이산화: out[k] = (lambda*Td * out[k-1] + Kp*Td * (pv[k] - pv[k-1])) / (Ts + lambda*Td)
-
+	/* 4. Filtered derivative on PV (2DOF derivative weight gamma=0). */
 	float D_term = 0.0f;
 	float Td = pPID->Td;
 	float lambda = pPID->lambda;
@@ -757,14 +817,23 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		float denominator = Ts + ( lambda * Td );
 		if( ( denominator < 0.0f ) || ( 0.0f < denominator ) )
 		{
-			float num_d = ( lambda * Td * pPID->v_prev ) + ( pPID->Kp * Td * ( pv - pPID->PV_prev ) );
+			float num_d = ( lambda * Td * pPID->v_prev )
+				+ ( pPID->Kp * Td * ( pPID->PV_filtered - pPID->PV_prev ) );
 			D_term = num_d / denominator;
 		}
 	}
 
 	// 5. 계산된 조작량 (Calculated MV) - 아직 제한 전
 	// 주의: 적분항은 '이전 스텝까지 누적된 값(I)'을 사용합니다.
-	float mv_calc = P_term + pPID->I - ( action * D_term );
+	/* Match the previous applied output on a live FAR/NEAR gain change. The
+	 * temporary bias then decays instead of becoming a long-lived I preload. */
+	const float pid_base = P_term + ( ( Ti > 0.0f ) ? pPID->I : 0.0f ) - ( action * D_term );
+	if( pPID->GainTransitionPending )
+	{
+		pPID->GainTransitionBias = pPID->GainTransitionTargetMV - pid_base;
+		pPID->GainTransitionPending = false;
+	}
+	float mv_calc = pid_base + pPID->GainTransitionBias;
 
 	// 6. 출력 제한 (Saturation) 및 실제 조작량 결정
 	float mv_final = mv_calc;
@@ -778,7 +847,35 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		mv_final = pPID->u_min;
 	}
 
-	/* Diagnostics only: the 1st-revision controller has no post-PID constraints. */
+	/* A cooling recipe needs a small continuous cooling bias around SV to stay
+	 * out of the SMPS zero-crossing/deadband. Reverse heat is allowed only after
+	 * a real over-cooling excursion, with hysteresis to avoid polarity chatter. */
+	bool cooling_floor_active = false;
+	if( cooling_near && ( COOL_CTRL_MODE == cool_heat ) )
+	{
+		if( !pPID->CoolingReverseHeatAllowed
+			&& ( pv <= ( sp - PID_COOLING_REVERSE_HEAT_ENTER_K ) ) )
+		{
+			pPID->CoolingReverseHeatAllowed = true;
+		}
+		else if( pPID->CoolingReverseHeatAllowed
+			&& ( pv >= ( sp - PID_COOLING_REVERSE_HEAT_EXIT_K ) ) )
+		{
+			pPID->CoolingReverseHeatAllowed = false;
+		}
+
+		if( !pPID->CoolingReverseHeatAllowed && ( mv_final < PID_COOLING_NEAR_MIN_MV ) )
+		{
+			mv_final = PID_COOLING_NEAR_MIN_MV;
+			cooling_floor_active = true;
+		}
+	}
+	else
+	{
+		pPID->CoolingReverseHeatAllowed = false;
+	}
+
+	/* Keep both the unconstrained calculation and the actual applied output. */
 	pPID->CalculatedMV = mv_calc;
 	pPID->AppliedMV = mv_final;
 
@@ -789,6 +886,11 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	if( Ti > 0.0f )
 	{
 		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
+		if( cooling_floor_active && ( Ki_term < 0.0f ) )
+		{
+			/* Do not wind the integrator farther into the enforced cooling floor. */
+			Ki_term = 0.0f;
+		}
 	}
 
 	// Saturation 오차 (실제 출력 - 계산된 출력)
@@ -800,10 +902,21 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	// 다음 주기를 위한 적분값 누적
 	pPID->I += Ki_term + back_calc_term;
 
+	/* Remove only the temporary gain-transition correction. With an 8 s time
+	 * constant, the 3rd-test 17%p profile jump is converted to about 2%p/s. */
+	if( PID_GAIN_TRANSITION_BIAS_TAU_S > Ts )
+	{
+		pPID->GainTransitionBias *= 1.0f - ( Ts / PID_GAIN_TRANSITION_BIAS_TAU_S );
+	}
+	else
+	{
+		pPID->GainTransitionBias = 0.0f;
+	}
+
 	// 8. 다음 스텝을 위해 현재 상태 저장
-	pPID->SP_ref_prev = SP_ref;
+	pPID->SP_ref_prev = sp;
 	pPID->SP_prev = sp;
-	pPID->PV_prev = pv;
+	pPID->PV_prev = pPID->PV_filtered;
 	pPID->v_prev = D_term;
 
 	return mv_final;
@@ -893,50 +1006,54 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->p0 = (2.0f * pPid->Kp * pPid->Td) / pPid->Ts;
 	pPid->b  = (2.0f * pPid->lambda * pPid->Td) / pPid->Ts;
 	pPid->v_prev = 0.0f;
+	pPid->PV_filtered = 0.0f;
 	pPid->PV_prev = 0.0f;
+	pPid->PVFilterInited = false;
 	pPid->EffectivePb = pCfg->Pb;
 	pPid->EffectiveTi = pCfg->Ti;
 	pPid->EffectiveTd = pCfg->Td;
 	pPid->EffectiveInputFilterCoeff = pCfg->InputFilterCoeff;
 	pPid->CalculatedMV = 0.0f;
 	pPid->AppliedMV = 0.0f;
+	pPid->GainTransitionBias = 0.0f;
+	pPid->GainTransitionTargetMV = 0.0f;
+	pPid->GainTransitionPending = false;
+	pPid->CoolingReverseHeatAllowed = false;
 }
 
 /******************************************************************************
- * @brief Apply changed PLC PID gains while preserving the running PID state.
+ * @brief Apply the profile selected by the internal FAR/NEAR state while
+ *        preserving the running PID state.
  *
- * The current controller caches PB/Ti/Td as floating-point gains in pid_st.
- * R00 calculated them directly from the control configuration every cycle,
- * but the current implementation previously refreshed them only while the
- * loop was disabled.  Refresh only the gain-dependent values here so a PLC
- * tuning write takes effect on the next PID calculation without resetting the
- * setpoint/PV history.  When Ti is set to zero, clear the accumulated integral
- * because integral action has explicitly been disabled.
+ * Ti=0 selects P-only calculation but does not delete the stored integral.
+ * Integral reset is owned by run/setpoint state changes, not PLC profile writes.
  ******************************************************************************/
-static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg, uint16_t effective_ti_raw )
+static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg,
+	uint16_t effective_pb_raw, uint16_t effective_ti_raw, uint16_t effective_td_raw )
 {
 	if( !pPid || !pCfg ) return;
 
-	const float kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
+	const float kp = effective_pb_raw ? ( 100.0f / ( effective_pb_raw * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
 	const float ti = effective_ti_raw * MULTIPLY_Ti_INT_TO_FLOAT;
-	const float td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;
-	pPid->EffectivePb = pCfg->Pb;
+	const float td = effective_td_raw * MULTIPLY_Td_INT_TO_FLOAT;
+	const float alpha = pCfg->InputFilterCoeff * MULTIPLY_PERCENT_TO_FLOAT;
+	pPid->EffectivePb = effective_pb_raw;
 	pPid->EffectiveTi = effective_ti_raw;
-	pPid->EffectiveTd = pCfg->Td;
-	pPid->EffectiveInputFilterCoeff =
-		( int16_t )( pPid->alpha * MULTIPLY_FLOAT_TO_PERCENT );
+	pPid->EffectiveTd = effective_td_raw;
+	pPid->EffectiveInputFilterCoeff = pCfg->InputFilterCoeff;
 
-	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) ) return;
+	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) && ( pPid->alpha == alpha ) ) return;
+
+	/* The next PID sample computes a bias against the new P/I/D terms so the
+	 * applied output begins at the previous sample instead of jumping. */
+	pPid->GainTransitionTargetMV = pPid->AppliedMV;
+	pPid->GainTransitionPending = true;
 
 	pPid->Kp = kp;
 	pPid->Ti = ti;
 	pPid->Td = td;
+	pPid->alpha = alpha;
 	pPid->Kaw = ( ti > 0.0f ) ? ( 1.0f / ti ) : 0.0f;
-
-	if( ti <= 0.0f )
-	{
-		pPid->I = 0.0f;
-	}
 
 	/* Keep the derived values coherent for the alternate PID implementation. */
 	const float a = 2.0f * pPid->Ti / pPid->Ts;

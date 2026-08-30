@@ -39,12 +39,19 @@
 
 #define ERROR_VALUE_I_TERM_WINDING 40.0f
 
-#define PID_NEAR_ENTER_ERROR_K 1.0f
-#define PID_NEAR_EXIT_ERROR_K 1.3f
+#define PID_HEATING_NEAR_ENTER_ERROR_K 1.0f
+#define PID_HEATING_NEAR_EXIT_ERROR_K 1.3f
+#define PID_COOLING_NEAR_ENTER_ERROR_K 1.0f
+#define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
+#define PID_HEATING_NEAR_TI_RAW 1800U
 #define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
-#define PID_COOLING_NEAR_MIN_MV 0.005f
+#define PID_COOLING_NEAR_MIN_MV 0.001f
 #define PID_COOLING_REVERSE_HEAT_ENTER_K 0.15f
 #define PID_COOLING_REVERSE_HEAT_EXIT_K 0.05f
+#define PID_COOLING_REVERSE_HEAT_CONFIRM_S 3.0f
+#define PID_COOLING_REVERSE_HEAT_MAX_MV 0.003f
+#define PID_COOLING_STABLE_SLEW_RATE_PER_S 0.001f
+#define PID_COOLING_TARGET_REACHED_ERROR_K 0.0f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -141,6 +148,9 @@ typedef struct {
 	float GainTransitionTargetMV;
 	bool GainTransitionPending;
 	bool CoolingReverseHeatAllowed;
+	bool CoolingTargetReached;
+	bool CoolingSlewActive;
+	float CoolingReverseHeatCandidateTime;
 
 	/* Diagnostic mirrors; these fields do not participate in PID calculation. */
 	uint16_t EffectivePb, EffectiveTi, EffectiveTd;
@@ -663,13 +673,21 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				pPid->GainTransitionBias = 0.0f;
 				pPid->GainTransitionPending = false;
 				pPid->CoolingReverseHeatAllowed = false;
+				pPid->CoolingTargetReached = false;
+				pPid->CoolingSlewActive = false;
+				pPid->CoolingReverseHeatCandidateTime = 0.0f;
 			}
 
 			PID_cache_gain_profile( pInst, pCfg );
 			const pid_gain_profile_st * const effective = PID_select_gain_profile( pInst );
 			const uint16_t effective_pb = effective ? effective->Pb : pCfg->Pb;
-			const uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
+			uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
 			const uint16_t effective_td = effective ? effective->Td : pCfg->Td;
+			if( ( PID_DIRECTION_HEATING == pInst->Direction )
+				&& ( PID_REGION_NEAR == pInst->Region ) && ( effective_ti > 0U ) )
+			{
+				effective_ti = PID_HEATING_NEAR_TI_RAW;
+			}
 
 			PID_instance_UpdateGains( pPid, pCfg, effective_pb, effective_ti, effective_td );
 			if( setpoint_changed )
@@ -717,14 +735,19 @@ static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pIn
 	}
 
 	const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
+	const bool heating = ( PID_DIRECTION_HEATING == pInst->Direction );
+	const float near_enter_error = heating ? PID_HEATING_NEAR_ENTER_ERROR_K
+		: PID_COOLING_NEAR_ENTER_ERROR_K;
+	const float near_exit_error = heating ? PID_HEATING_NEAR_EXIT_ERROR_K
+		: PID_COOLING_NEAR_EXIT_ERROR_K;
 	if( PID_REGION_FAR == pInst->Region )
 	{
-		if( abs_error <= PID_NEAR_ENTER_ERROR_K )
+		if( abs_error <= near_enter_error )
 		{
 			pInst->Region = PID_REGION_NEAR;
 		}
 	}
-	else if( abs_error >= PID_NEAR_EXIT_ERROR_K )
+	else if( abs_error >= near_exit_error )
 	{
 		pInst->Region = PID_REGION_FAR;
 	}
@@ -847,32 +870,85 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		mv_final = pPID->u_min;
 	}
 
-	/* A cooling recipe needs a small continuous cooling bias around SV to stay
-	 * out of the SMPS zero-crossing/deadband. Reverse heat is allowed only after
-	 * a real over-cooling excursion, with hysteresis to avoid polarity chatter. */
-	bool cooling_floor_active = false;
+	/* Bound the intentional cooling limit cycle near SV. A small cooling floor
+	 * keeps the SMPS out of zero during normal hold. Reverse heat requires a
+	 * filtered 0.15 K over-cooling condition for three seconds and is limited to
+	 * 0.3%, then all later recovery changes are slew-limited. */
+	bool cooling_output_constrained = false;
 	if( cooling_near && ( COOL_CTRL_MODE == cool_heat ) )
 	{
-		if( !pPID->CoolingReverseHeatAllowed
-			&& ( pv <= ( sp - PID_COOLING_REVERSE_HEAT_ENTER_K ) ) )
+		if( !pPID->CoolingTargetReached
+			&& ( pPID->PV_filtered <= ( sp + PID_COOLING_TARGET_REACHED_ERROR_K ) ) )
 		{
-			pPID->CoolingReverseHeatAllowed = true;
+			pPID->CoolingTargetReached = true;
+			pPID->CoolingSlewActive = true;
 		}
-		else if( pPID->CoolingReverseHeatAllowed
-			&& ( pv >= ( sp - PID_COOLING_REVERSE_HEAT_EXIT_K ) ) )
+
+		if( pPID->CoolingTargetReached && !pPID->CoolingReverseHeatAllowed )
 		{
-			pPID->CoolingReverseHeatAllowed = false;
+			if( pPID->PV_filtered <= ( sp - PID_COOLING_REVERSE_HEAT_ENTER_K ) )
+			{
+				pPID->CoolingReverseHeatCandidateTime += Ts;
+				if( pPID->CoolingReverseHeatCandidateTime >= PID_COOLING_REVERSE_HEAT_CONFIRM_S )
+				{
+					pPID->CoolingReverseHeatAllowed = true;
+					pPID->CoolingSlewActive = true;
+					pPID->CoolingReverseHeatCandidateTime = 0.0f;
+				}
+			}
+			else
+			{
+				pPID->CoolingReverseHeatCandidateTime = 0.0f;
+			}
+		}
+
+		if( pPID->CoolingReverseHeatAllowed )
+		{
+			if( pPID->PV_filtered >= ( sp - PID_COOLING_REVERSE_HEAT_EXIT_K ) )
+			{
+				pPID->CoolingReverseHeatAllowed = false;
+			}
+			else if( mv_final < -PID_COOLING_REVERSE_HEAT_MAX_MV )
+			{
+				mv_final = -PID_COOLING_REVERSE_HEAT_MAX_MV;
+				cooling_output_constrained = true;
+			}
+			else if( mv_final > 0.0f )
+			{
+				mv_final = 0.0f;
+				cooling_output_constrained = true;
+			}
 		}
 
 		if( !pPID->CoolingReverseHeatAllowed && ( mv_final < PID_COOLING_NEAR_MIN_MV ) )
 		{
 			mv_final = PID_COOLING_NEAR_MIN_MV;
-			cooling_floor_active = true;
+			cooling_output_constrained = true;
+		}
+
+		if( pPID->CoolingTargetReached && pPID->CoolingSlewActive )
+		{
+			const float max_delta = PID_COOLING_STABLE_SLEW_RATE_PER_S * Ts;
+			const float upper = pPID->AppliedMV + max_delta;
+			const float lower = pPID->AppliedMV - max_delta;
+			if( mv_final > upper )
+			{
+				mv_final = upper;
+				cooling_output_constrained = true;
+			}
+			else if( mv_final < lower )
+			{
+				mv_final = lower;
+				cooling_output_constrained = true;
+			}
 		}
 	}
 	else
 	{
 		pPID->CoolingReverseHeatAllowed = false;
+		pPID->CoolingTargetReached = false;
+		pPID->CoolingSlewActive = false;
+		pPID->CoolingReverseHeatCandidateTime = 0.0f;
 	}
 
 	/* Keep both the unconstrained calculation and the actual applied output. */
@@ -886,9 +962,11 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	if( Ti > 0.0f )
 	{
 		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
-		if( cooling_floor_active && ( Ki_term < 0.0f ) )
+		if( cooling_output_constrained
+			&& ( ( ( mv_final > mv_calc ) && ( Ki_term < 0.0f ) )
+				|| ( ( mv_final < mv_calc ) && ( Ki_term > 0.0f ) ) ) )
 		{
-			/* Do not wind the integrator farther into the enforced cooling floor. */
+			/* Do not integrate farther into any applied-output constraint. */
 			Ki_term = 0.0f;
 		}
 	}
@@ -1019,6 +1097,9 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->GainTransitionTargetMV = 0.0f;
 	pPid->GainTransitionPending = false;
 	pPid->CoolingReverseHeatAllowed = false;
+	pPid->CoolingTargetReached = false;
+	pPid->CoolingSlewActive = false;
+	pPid->CoolingReverseHeatCandidateTime = 0.0f;
 }
 
 /******************************************************************************

@@ -43,7 +43,8 @@
 #define PID_HEATING_NEAR_EXIT_ERROR_K 1.3f
 #define PID_COOLING_NEAR_ENTER_ERROR_K 1.0f
 #define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
-#define PID_HEATING_NEAR_TI_RAW 1800U
+#define PID_HEATING_NEAR_APPROACH_TI_RAW 1200U
+#define PID_HEATING_NEAR_HOLD_TI_RAW 2400U
 #define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
 #define PID_COOLING_NEAR_MIN_MV 0.001f
 #define PID_COOLING_REVERSE_HEAT_ENTER_K 0.15f
@@ -151,6 +152,7 @@ typedef struct {
 	bool CoolingTargetReached;
 	bool CoolingSlewActive;
 	float CoolingReverseHeatCandidateTime;
+	bool HeatingTargetReached;
 
 	/* Diagnostic mirrors; these fields do not participate in PID calculation. */
 	uint16_t EffectivePb, EffectiveTi, EffectiveTd;
@@ -676,6 +678,7 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				pPid->CoolingTargetReached = false;
 				pPid->CoolingSlewActive = false;
 				pPid->CoolingReverseHeatCandidateTime = 0.0f;
+				pPid->HeatingTargetReached = false;
 			}
 
 			PID_cache_gain_profile( pInst, pCfg );
@@ -683,10 +686,15 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			const uint16_t effective_pb = effective ? effective->Pb : pCfg->Pb;
 			uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
 			const uint16_t effective_td = effective ? effective->Td : pCfg->Td;
+			if( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( pInst->PV >= pCfg->SV ) )
+			{
+				pPid->HeatingTargetReached = true;
+			}
 			if( ( PID_DIRECTION_HEATING == pInst->Direction )
 				&& ( PID_REGION_NEAR == pInst->Region ) && ( effective_ti > 0U ) )
 			{
-				effective_ti = PID_HEATING_NEAR_TI_RAW;
+				effective_ti = pPid->HeatingTargetReached
+					? PID_HEATING_NEAR_HOLD_TI_RAW : PID_HEATING_NEAR_APPROACH_TI_RAW;
 			}
 
 			PID_instance_UpdateGains( pPid, pCfg, effective_pb, effective_ti, effective_td );
@@ -1100,6 +1108,7 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->CoolingTargetReached = false;
 	pPid->CoolingSlewActive = false;
 	pPid->CoolingReverseHeatCandidateTime = 0.0f;
+	pPid->HeatingTargetReached = false;
 }
 
 /******************************************************************************

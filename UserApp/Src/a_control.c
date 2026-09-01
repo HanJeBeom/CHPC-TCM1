@@ -45,6 +45,10 @@
 #define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
 #define PID_HEATING_NEAR_APPROACH_TI_RAW 1200U
 #define PID_HEATING_NEAR_HOLD_TI_RAW 2400U
+#define PID_FAR_APPROACH_I_ENTER_ERROR_K 3.0f
+#define PID_FAR_APPROACH_I_EXIT_ERROR_K 3.3f
+#define PID_FAR_APPROACH_I_TI_RAW 600U
+#define PID_FAR_APPROACH_I_LIMIT 0.20f
 #define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
 #define PID_COOLING_NEAR_MIN_MV 0.0f
 #define PID_POST_CROSS_I_ACCEL_ERROR_K 0.01f
@@ -151,6 +155,7 @@ typedef struct {
 	bool CoolingSlewActive;
 	float CoolingReverseHeatCandidateTime;
 	bool HeatingTargetReached;
+	bool FarApproachIActive;
 
 	/* Diagnostic mirrors; these fields do not participate in PID calculation. */
 	uint16_t EffectivePb, EffectiveTi, EffectiveTd;
@@ -665,6 +670,8 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		else
 		{
 			pid_st * const pPid = &pid_inst[ pInst->CH ];
+			const bool was_near = ( PID_REGION_NEAR == pInst->Region );
+			const bool was_far_approach_i_active = pPid->FarApproachIActive;
 			const bool setpoint_changed = PID_update_operating_state( pInst, pCfg );
 			if( setpoint_changed )
 			{
@@ -677,6 +684,42 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				pPid->CoolingSlewActive = false;
 				pPid->CoolingReverseHeatCandidateTime = 0.0f;
 				pPid->HeatingTargetReached = false;
+				pPid->FarApproachIActive = false;
+			}
+
+			const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
+			if( PID_REGION_NEAR == pInst->Region )
+			{
+				pPid->FarApproachIActive = false;
+			}
+			else if( pPid->FarApproachIActive )
+			{
+				if( abs_error >= PID_FAR_APPROACH_I_EXIT_ERROR_K )
+				{
+					pPid->FarApproachIActive = false;
+				}
+			}
+			else if( abs_error <= PID_FAR_APPROACH_I_ENTER_ERROR_K )
+			{
+				pPid->FarApproachIActive = true;
+			}
+
+			const bool region_changed = was_near != ( PID_REGION_NEAR == pInst->Region );
+			const bool far_approach_i_changed = was_far_approach_i_active != pPid->FarApproachIActive;
+			const bool preserve_approach_i = !was_near
+				&& ( PID_REGION_NEAR == pInst->Region )
+				&& was_far_approach_i_active;
+			if( !setpoint_changed && ( region_changed || far_approach_i_changed ) )
+			{
+				/* Preserve the capped approach I when either direction enters NEAR.
+				 * Every other transition starts with a fresh I. The decaying bias
+				 * keeps either transfer bumpless. */
+				pPid->GainTransitionTargetMV = pPid->AppliedMV;
+				pPid->GainTransitionPending = true;
+				if( !preserve_approach_i )
+				{
+					pPid->I = 0.0f;
+				}
 			}
 
 			PID_cache_gain_profile( pInst, pCfg );
@@ -684,6 +727,10 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			const uint16_t effective_pb = effective ? effective->Pb : pCfg->Pb;
 			uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
 			const uint16_t effective_td = effective ? effective->Td : pCfg->Td;
+			if( ( PID_REGION_FAR == pInst->Region ) && pPid->FarApproachIActive )
+			{
+				effective_ti = PID_FAR_APPROACH_I_TI_RAW;
+			}
 			if( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( pInst->PV >= pCfg->SV ) )
 			{
 				pPid->HeatingTargetReached = true;
@@ -960,6 +1007,17 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 다음 주기를 위한 적분값 누적
 	pPID->I += Ki_term + back_calc_term;
+	if( pPID->FarApproachIActive )
+	{
+		if( pPID->I > PID_FAR_APPROACH_I_LIMIT )
+		{
+			pPID->I = PID_FAR_APPROACH_I_LIMIT;
+		}
+		else if( pPID->I < -PID_FAR_APPROACH_I_LIMIT )
+		{
+			pPID->I = -PID_FAR_APPROACH_I_LIMIT;
+		}
+	}
 
 	/* Remove only the temporary gain-transition correction. With an 8 s time
 	 * constant, the 3rd-test 17%p profile jump is converted to about 2%p/s. */
@@ -1082,6 +1140,7 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->CoolingSlewActive = false;
 	pPid->CoolingReverseHeatCandidateTime = 0.0f;
 	pPid->HeatingTargetReached = false;
+	pPid->FarApproachIActive = false;
 }
 
 /******************************************************************************

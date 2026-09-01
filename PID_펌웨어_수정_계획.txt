@@ -2104,6 +2104,28 @@ D=100 2차 시험 근거:
 - 루트 EXEC는 새 19차 Debug HEX와 크기 및 SHA-256이 일치한다.
 - 최종 list 파일에는 19차 조건부 I 가속이 포함되고 FarApproachIActive와 PID_FAR_APPROACH 계열 코드는 없다.
 
+3.44 22차 재복귀 - 보존 커밋 제어 소스 복원
+
+재복귀 내용:
+
+- 19차 임시 복귀 커밋 775b09f 위에서 보존 커밋 c3f282e의 22차 a_control.c를 복원했다.
+- 20차 3℃ 접근 I(Ti=60초), ±20% 제한과 21·22차 APPROACH -> NEAR 방향 공통 I 인계를 다시 적용했다.
+- 19차 SV 통과 후 I 해제 2배, 냉각 0% 자연도달, 역가열 금지와 기존 Slew도 22차 구성대로 유지한다.
+- 19차 임시 복귀 기록과 22차 이전 시험 이력은 계획서에 그대로 보존했다.
+- a_output.c, PLC configured PB/Ti/Td, 입력필터 20과 40열 CSV 형식은 변경하지 않았다.
+
+22차 재복귀 빌드 기록:
+
+- 재복귀 및 빌드일: 2026-09-01
+- STM32CubeIDE 2.2.0 GNU Make 2.2.200 및 GNU Tools for STM32 14.3.rel1로 전체 clean 빌드에 성공했다.
+- Debug main-build: text 185812, data 27512, bss 30624 bytes
+- Debug/CHPC-TCM1.elf: 2,170,260 bytes
+- Debug/CHPC-TCM1.elf SHA-256: BCF0650CE3E316321785FD2C29885A9C79E41C91123ECEAE82309C3DB69E878F
+- Debug/CHPC-TCM1.hex: 600,144 bytes
+- Debug/CHPC-TCM1.hex SHA-256: BD1F9D5B6DD936F0B24FA7C7017737D63125D8E2F9172B9E4859CCB769C57741
+- HEX 크기와 SHA-256은 최초 22차 빌드 및 보존 커밋 시점 기록과 정확히 일치한다.
+- 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 일치한다.
+
 4. 시험 및 변경 원칙
 
 - 한 시험에서는 한 항목만 변경한다.

@@ -732,20 +732,21 @@ static void run_smps_comm( output_et out_type, int8_t out_ch, float smps_mv, ...
 			}
 			else
 			{
-				// iMV is pre-mille (1/1000) scale.
-				// Since the formula below scales smps_mv by 1/8000,
-				// it must be normalized back to a floating-point range of [-1.0, 1.0].
-				if( iMV < 0 )
+				/* Cross-fade the half-gain and calibrated polynomial branches from
+				 * 5% to 10% so the physical command stays continuous at 5%. */
+				const float sign = ( iMV < 0 ) ? -1.0f : 1.0f;
+				const int16_t magnitude = abs( iMV );
+				float mapped = (-1.9424E-11f*magnitude)*magnitude*magnitude*magnitude*magnitude
+					+ (4.41E-8f*magnitude)*magnitude*magnitude*magnitude
+					- (3.3907E-5f*magnitude)*magnitude*magnitude
+					+ (1.597E-2f*magnitude)*magnitude + 1.345f*magnitude + 6.3486f;
+				if( magnitude < 100 )
 				{
-					iMV *= -1;
-					smps_mv = (-1.9424E-11f*iMV)*iMV*iMV*iMV*iMV + (4.41E-8f*iMV)*iMV*iMV*iMV - (3.3907E-5f*iMV)*iMV*iMV + (1.597E-2f*iMV)*iMV + 1.345f*iMV + 6.3486f;
-					smps_mv *= -1.0f;
+					const float blend = ( magnitude - 50.0f ) / 50.0f;
+					const float low_power_equivalent = 4.0f * magnitude;
+					mapped = low_power_equivalent + blend * ( mapped - low_power_equivalent );
 				}
-				else
-				{
-					smps_mv = (-1.9424E-11f*iMV)*iMV*iMV*iMV*iMV + (4.41E-8f*iMV)*iMV*iMV*iMV - (3.3907E-5f*iMV)*iMV*iMV + (1.597E-2f*iMV)*iMV + 1.345f*iMV + 6.3486f;
-				}
-				smps_mv /= 8000.0f;
+				smps_mv = sign * mapped / 8000.0f;
 			}
 		}
 	#endif

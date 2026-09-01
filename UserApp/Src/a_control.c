@@ -45,12 +45,14 @@
 #define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
 #define PID_HEATING_NEAR_APPROACH_TI_RAW 1200U
 #define PID_HEATING_NEAR_HOLD_TI_RAW 2400U
+#define PID_FAR_APPROACH_I_ENTER_ERROR_K 3.0f
+#define PID_FAR_APPROACH_I_EXIT_ERROR_K 3.3f
+#define PID_FAR_APPROACH_I_TI_RAW 600U
+#define PID_FAR_APPROACH_I_LIMIT 0.20f
 #define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
-#define PID_COOLING_NEAR_MIN_MV 0.001f
-#define PID_COOLING_REVERSE_HEAT_ENTER_K 0.15f
-#define PID_COOLING_REVERSE_HEAT_EXIT_K 0.05f
-#define PID_COOLING_REVERSE_HEAT_CONFIRM_S 3.0f
-#define PID_COOLING_REVERSE_HEAT_MAX_MV 0.003f
+#define PID_COOLING_NEAR_MIN_MV 0.0f
+#define PID_POST_CROSS_I_ACCEL_ERROR_K 0.01f
+#define PID_POST_CROSS_I_ACCEL_FACTOR 2.0f
 #define PID_COOLING_STABLE_SLEW_RATE_PER_S 0.001f
 #define PID_COOLING_TARGET_REACHED_ERROR_K 0.0f
 
@@ -153,6 +155,7 @@ typedef struct {
 	bool CoolingSlewActive;
 	float CoolingReverseHeatCandidateTime;
 	bool HeatingTargetReached;
+	bool FarApproachIActive;
 
 	/* Diagnostic mirrors; these fields do not participate in PID calculation. */
 	uint16_t EffectivePb, EffectiveTi, EffectiveTd;
@@ -187,7 +190,7 @@ static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pIn
 static __RAM_FUNC void PID_cache_gain_profile( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
 static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_loop_instance_st const *pInst );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
-	cool_heat_mode_et cool_heat, bool cooling_near );
+	cool_heat_mode_et cool_heat, bool heating_near, bool cooling_near );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
 
@@ -667,6 +670,8 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		else
 		{
 			pid_st * const pPid = &pid_inst[ pInst->CH ];
+			const bool was_near = ( PID_REGION_NEAR == pInst->Region );
+			const bool was_far_approach_i_active = pPid->FarApproachIActive;
 			const bool setpoint_changed = PID_update_operating_state( pInst, pCfg );
 			if( setpoint_changed )
 			{
@@ -679,6 +684,42 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				pPid->CoolingSlewActive = false;
 				pPid->CoolingReverseHeatCandidateTime = 0.0f;
 				pPid->HeatingTargetReached = false;
+				pPid->FarApproachIActive = false;
+			}
+
+			const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
+			if( PID_REGION_NEAR == pInst->Region )
+			{
+				pPid->FarApproachIActive = false;
+			}
+			else if( pPid->FarApproachIActive )
+			{
+				if( abs_error >= PID_FAR_APPROACH_I_EXIT_ERROR_K )
+				{
+					pPid->FarApproachIActive = false;
+				}
+			}
+			else if( abs_error <= PID_FAR_APPROACH_I_ENTER_ERROR_K )
+			{
+				pPid->FarApproachIActive = true;
+			}
+
+			const bool region_changed = was_near != ( PID_REGION_NEAR == pInst->Region );
+			const bool far_approach_i_changed = was_far_approach_i_active != pPid->FarApproachIActive;
+			const bool preserve_approach_i = !was_near
+				&& ( PID_REGION_NEAR == pInst->Region )
+				&& was_far_approach_i_active;
+			if( !setpoint_changed && ( region_changed || far_approach_i_changed ) )
+			{
+				/* Preserve the capped approach I when either direction enters NEAR.
+				 * Every other transition starts with a fresh I. The decaying bias
+				 * keeps either transfer bumpless. */
+				pPid->GainTransitionTargetMV = pPid->AppliedMV;
+				pPid->GainTransitionPending = true;
+				if( !preserve_approach_i )
+				{
+					pPid->I = 0.0f;
+				}
 			}
 
 			PID_cache_gain_profile( pInst, pCfg );
@@ -686,6 +727,10 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			const uint16_t effective_pb = effective ? effective->Pb : pCfg->Pb;
 			uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
 			const uint16_t effective_td = effective ? effective->Td : pCfg->Td;
+			if( ( PID_REGION_FAR == pInst->Region ) && pPid->FarApproachIActive )
+			{
+				effective_ti = PID_FAR_APPROACH_I_TI_RAW;
+			}
 			if( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( pInst->PV >= pCfg->SV ) )
 			{
 				pPid->HeatingTargetReached = true;
@@ -705,9 +750,11 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			}
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
+			const bool heating_near = ( PID_DIRECTION_HEATING == pInst->Direction )
+				&& ( PID_REGION_NEAR == pInst->Region );
 			const bool cooling_near = ( PID_DIRECTION_COOLING == pInst->Direction )
 				&& ( PID_REGION_NEAR == pInst->Region );
-			pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat, cooling_near );
+			pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat, heating_near, cooling_near );
 			retval = 1;
 		}
 	}
@@ -801,7 +848,7 @@ static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_lo
  * @return Manipulated Value (MV)
  ******************************************************************************/
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
-	cool_heat_mode_et cool_heat, bool cooling_near )
+	cool_heat_mode_et cool_heat, bool heating_near, bool cooling_near )
 {
 	/****************************************************************************
 	InputFilterCoeff filters PV only. P and I use the true setpoint error against
@@ -878,10 +925,8 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		mv_final = pPID->u_min;
 	}
 
-	/* Bound the intentional cooling limit cycle near SV. A small cooling floor
-	 * keeps the SMPS out of zero during normal hold. Reverse heat requires a
-	 * filtered 0.15 K over-cooling condition for three seconds and is limited to
-	 * 0.3%, then all later recovery changes are slew-limited. */
+	/* Cooling remains unipolar and continuous. Zero output is reached only
+	 * when the PID calculation naturally unwinds to zero. */
 	bool cooling_output_constrained = false;
 	if( cooling_near && ( COOL_CTRL_MODE == cool_heat ) )
 	{
@@ -892,43 +937,9 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 			pPID->CoolingSlewActive = true;
 		}
 
-		if( pPID->CoolingTargetReached && !pPID->CoolingReverseHeatAllowed )
-		{
-			if( pPID->PV_filtered <= ( sp - PID_COOLING_REVERSE_HEAT_ENTER_K ) )
-			{
-				pPID->CoolingReverseHeatCandidateTime += Ts;
-				if( pPID->CoolingReverseHeatCandidateTime >= PID_COOLING_REVERSE_HEAT_CONFIRM_S )
-				{
-					pPID->CoolingReverseHeatAllowed = true;
-					pPID->CoolingSlewActive = true;
-					pPID->CoolingReverseHeatCandidateTime = 0.0f;
-				}
-			}
-			else
-			{
-				pPID->CoolingReverseHeatCandidateTime = 0.0f;
-			}
-		}
-
-		if( pPID->CoolingReverseHeatAllowed )
-		{
-			if( pPID->PV_filtered >= ( sp - PID_COOLING_REVERSE_HEAT_EXIT_K ) )
-			{
-				pPID->CoolingReverseHeatAllowed = false;
-			}
-			else if( mv_final < -PID_COOLING_REVERSE_HEAT_MAX_MV )
-			{
-				mv_final = -PID_COOLING_REVERSE_HEAT_MAX_MV;
-				cooling_output_constrained = true;
-			}
-			else if( mv_final > 0.0f )
-			{
-				mv_final = 0.0f;
-				cooling_output_constrained = true;
-			}
-		}
-
-		if( !pPID->CoolingReverseHeatAllowed && ( mv_final < PID_COOLING_NEAR_MIN_MV ) )
+		pPID->CoolingReverseHeatAllowed = false;
+		pPID->CoolingReverseHeatCandidateTime = 0.0f;
+		if( mv_final < PID_COOLING_NEAR_MIN_MV )
 		{
 			mv_final = PID_COOLING_NEAR_MIN_MV;
 			cooling_output_constrained = true;
@@ -970,6 +981,15 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	if( Ti > 0.0f )
 	{
 		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
+		const bool correcting_heating_overshoot = heating_near
+			&& ( pPID->PV_filtered >= ( sp + PID_POST_CROSS_I_ACCEL_ERROR_K ) );
+		const bool correcting_cooling_undershoot = cooling_near
+			&& ( pPID->PV_filtered <= ( sp - PID_POST_CROSS_I_ACCEL_ERROR_K ) );
+		if( correcting_heating_overshoot || correcting_cooling_undershoot )
+		{
+			/* Unwind the existing I state faster without changing Ti or MV abruptly. */
+			Ki_term *= PID_POST_CROSS_I_ACCEL_FACTOR;
+		}
 		if( cooling_output_constrained
 			&& ( ( ( mv_final > mv_calc ) && ( Ki_term < 0.0f ) )
 				|| ( ( mv_final < mv_calc ) && ( Ki_term > 0.0f ) ) ) )
@@ -987,6 +1007,17 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 다음 주기를 위한 적분값 누적
 	pPID->I += Ki_term + back_calc_term;
+	if( pPID->FarApproachIActive )
+	{
+		if( pPID->I > PID_FAR_APPROACH_I_LIMIT )
+		{
+			pPID->I = PID_FAR_APPROACH_I_LIMIT;
+		}
+		else if( pPID->I < -PID_FAR_APPROACH_I_LIMIT )
+		{
+			pPID->I = -PID_FAR_APPROACH_I_LIMIT;
+		}
+	}
 
 	/* Remove only the temporary gain-transition correction. With an 8 s time
 	 * constant, the 3rd-test 17%p profile jump is converted to about 2%p/s. */
@@ -1109,6 +1140,7 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->CoolingSlewActive = false;
 	pPid->CoolingReverseHeatCandidateTime = 0.0f;
 	pPid->HeatingTargetReached = false;
+	pPid->FarApproachIActive = false;
 }
 
 /******************************************************************************

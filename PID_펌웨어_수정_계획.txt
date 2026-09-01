@@ -2624,3 +2624,82 @@ PID 수식 수정 2단계-A 빌드 기록:
 - Debug/CHPC-TCM1.hex SHA-256: B997ED103F4FC9110FD44E3B4F97D310845B4F132C8030AE1AD0083D9979C104
 - makefile post-build의 Unix식 cp만 Windows에서 실패했으며 생성된 HEX를 루트 EXEC에 직접 복사했다.
 - 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 동일하다.
+
+
+3.51 태초마을 29차 수정 - 냉각 NEAR Ti 120초 적용
+
+28차 실측 결론:
+
+- 40℃ 가열 후반 30초 P-P는 대부분 0.03~0.05℃이고 마지막 300초 평균은 40.0454℃, 전체 P-P 0.067℃로 안정적이었다.
+- 40→20℃ 냉각은 Effective PB=24000 적용 후 27차의 0.733℃ 발산 진동이 사라지고 후반 30초 P-P가 0.024~0.045℃로 감소했다.
+- 냉각은 ±0.1℃ 연속 300초를 262.7초부터 달성했지만 평균 PV가 360초 20.0037℃에서 900초 19.9042℃로 서서히 내려갔다.
+- 냉각 출력이 약 1.0%에서 0.34%로 너무 천천히 감소했으므로 PB 2배로 Kp와 함께 Ki까지 절반이 된 것이 장시간 SV 중심 복귀 지연의 원인으로 판단한다.
+
+29차 단독 변경:
+
+- 냉각 NEAR Effective PB=24000과 나머지 28차 구조를 모두 유지한다.
+- 냉각 NEAR에서 PLC Ti가 0보다 클 때 Effective Ti만 2400에서 1200으로 적용한다.
+- 28차 대비 Kp는 동일하고 Ki만 2배가 되며, 27차와 비교하면 Kp는 절반이고 Ki는 동일하다.
+- PLC가 보관·전송하는 PB/Ti 원본은 변경하지 않는다.
+- pid_params_pending 진단은 냉각 NEAR의 의도적 Effective Ti=1200을 미적용 상태로 오인하지 않도록 expected Ti를 사용한다.
+- 가열, FAR, NEAR D=0, signed PI, anti-windup, GainTransitionBias와 SMPS 연속 변환은 변경하지 않는다.
+
+29차 시험 판정:
+
+- 40→20℃ 냉각에서 Effective PB=24000, Effective Ti=1200, Effective Td=0과 reverse heat allowed=1을 확인한다.
+- NEAR 진입 후 최소 600초 기록하고 30초 P-P가 0.10℃ 이하이며 시간이 지나도 증가하지 않아야 한다.
+- 마지막 300초 평균 PV는 19.95~20.05℃, 전체 P-P는 0.10℃ 이하를 목표로 한다.
+- 28차보다 20℃ 중심 도달과 출력 감소가 빨라져야 하며, 27차처럼 10~12초 주기의 진폭 증가가 재발하면 실패로 판정한다.
+- 가열 경로는 변경하지 않았으므로 냉각 합격 후 필요 시 확인 시험만 수행한다.
+
+29차 빌드 기록:
+
+- 빌드일: 2026-09-01
+- 빌드 도구: STM32CubeIDE 2.2.0 내장 GNU Make 및 GNU Tools for STM32 14.3.rel1
+- 컴파일·링크·ELF/HEX 생성 성공: 오류 0, 기존 미사용 PID 함수 3건의 경고만 발생
+- Debug main-build: text 184780, data 27352, bss 30624 bytes
+- Debug/CHPC-TCM1.elf: 2,169,404 bytes
+- Debug/CHPC-TCM1.elf SHA-256: AE447082C6C5052F6793027042A24D5D830CB370241F3A87C4B99DB493E23D5B
+- Debug/CHPC-TCM1.hex: 596,785 bytes
+- Debug/CHPC-TCM1.hex SHA-256: 9790C0B50070B26040538E5D288CD32955CADDC94D85319B41A27DFAF388E498
+- makefile post-build의 Unix식 cp만 Windows에서 실패했으며 생성된 HEX를 루트 EXEC에 직접 복사했다.
+- 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 동일하다.
+
+
+3.52 태초마을 30차 수정 - 냉각 NEAR Ti 180초 중간값 적용
+
+29차 실측 결론:
+
+- 40→20℃ 냉각에서 Effective PB=24000, Effective Ti=1200, Effective Td=0과 양방향 출력 적용은 정상이었다.
+- 냉각은 28차보다 20℃ 중심에 빨리 접근했지만 NEAR 100초 이후 20초 P-P가 0.11~0.195℃로 28차의 0.024~0.045℃보다 커졌다.
+- 냉각 NEAR 기록은 254.5초로 계획한 600초보다 짧지만 이미 0.10℃ P-P 기준을 반복 초과하여 Ti=1200은 실패로 판정한다.
+- 동일 로그의 40℃ 가열도 후반 20초 P-P 0.12~0.21℃가 나타났으나 29차 변경은 냉각 NEAR에만 적용되므로 Ti 변경의 직접 영향은 아니다.
+- 가열 RTD1과 RTD2가 함께 변동하여 단순 단일센서 노이즈보다 실제 열부하 또는 장비 조건 재현성 문제도 병행 확인해야 한다.
+
+30차 단독 변경:
+
+- 냉각 NEAR Effective PB=24000을 유지하고 Effective Ti만 1200에서 1800으로 변경한다.
+- 28차 대비 Kp는 동일하고 Ki는 약 1.33배, 29차 대비 Kp는 동일하고 Ki는 2/3이다.
+- PLC PB/Ti 원본, 가열, FAR, NEAR D=0, signed PI, anti-windup, GainTransitionBias와 SMPS 연속 변환은 변경하지 않는다.
+- 28차의 작은 진동과 29차의 빠른 중심 복귀 사이의 중간 적분 이득만 시험한다.
+
+30차 시험 판정:
+
+- 우선 40→20℃ 냉각을 시험해 Effective PB=24000, Effective Ti=1800, Effective Td=0과 reverse heat allowed=1을 확인한다.
+- NEAR 진입 후 최소 600초 기록하고 30초 P-P가 0.10℃ 이하이며 후반으로 갈수록 증가하지 않아야 한다.
+- 마지막 300초 평균 PV는 19.95~20.05℃, 전체 P-P는 0.10℃ 이하를 목표로 한다.
+- 냉각 합격 후 동일 펌웨어로 20→40℃ 가열을 재시험해 29차에서 나타난 가열 변동의 재현 여부를 별도로 판정한다.
+- 30차도 냉각 P-P가 0.10℃를 넘으면 추가 중간값 탐색을 중단하고 28차 복귀 또는 장비 조건 점검을 우선한다.
+
+30차 빌드 기록:
+
+- 빌드일: 2026-09-01
+- 빌드 도구: STM32CubeIDE 2.2.0 내장 GNU Make 및 GNU Tools for STM32 14.3.rel1
+- 컴파일·링크·ELF/HEX 생성 성공: 오류 0, 기존 미사용 PID 함수 3건의 경고만 발생
+- Debug main-build: text 184780, data 27352, bss 30624 bytes
+- Debug/CHPC-TCM1.elf: 2,169,404 bytes
+- Debug/CHPC-TCM1.elf SHA-256: 0AA6252C9324864DA31F153416A7A50C4910D3104B1D93AADFD68F744935EF65
+- Debug/CHPC-TCM1.hex: 596,785 bytes
+- Debug/CHPC-TCM1.hex SHA-256: 1CDCA3D27E48D14A7721F0D2BE16F0544901F926AE5D4C3F9EBB4D53B88511AE
+- makefile post-build의 Unix식 cp만 Windows에서 실패했으며 생성된 HEX를 루트 EXEC에 직접 복사했다.
+- 루트 EXEC는 Debug HEX와 크기 및 SHA-256이 동일하다.

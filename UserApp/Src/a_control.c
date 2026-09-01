@@ -44,6 +44,7 @@
 #define PID_COOLING_NEAR_ENTER_ERROR_K 1.0f
 #define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
 #define PID_COOLING_NEAR_PB_SCALE 2U
+#define PID_COOLING_NEAR_TI_RAW 1800U
 #define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
 
 /*****************************************************************************/
@@ -175,6 +176,7 @@ static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pIn
 static __RAM_FUNC void PID_cache_gain_profile( control_loop_instance_st *pInst, control_loop_config_st const *pCfg );
 static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_loop_instance_st const *pInst );
 static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st const *pInst, uint16_t pb );
+static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st const *pInst, uint16_t ti );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
 	cool_heat_mode_et cool_heat, bool cooling_near );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
@@ -424,6 +426,7 @@ static bool control_loop_get_pid_diagnostic_status( int loop_idx, pid_diagnostic
 	const control_loop_instance_st * const pInst = &ControllerVars.Inst[ loop_idx ];
 	const control_loop_config_st * const pCfg = &ControllerVars.Cfg[ loop_idx ];
 	const uint16_t expected_pb = PID_apply_direction_pb( pInst, pCfg->Pb );
+	const uint16_t expected_ti = PID_apply_direction_ti( pInst, pCfg->Ti );
 	const uint16_t expected_td = ( PID_REGION_NEAR == pInst->Region ) ? 0U : pCfg->Td;
 	status->EffectivePb = pPid->EffectivePb;
 	status->EffectiveTi = pPid->EffectiveTi;
@@ -432,7 +435,7 @@ static bool control_loop_get_pid_diagnostic_status( int loop_idx, pid_diagnostic
 	status->Direction = ( uint16_t )pInst->Direction;
 	status->Region = ( uint16_t )pInst->Region;
 	status->Pending = ( expected_pb != pPid->EffectivePb )
-		|| ( pCfg->Ti != pPid->EffectiveTi )
+		|| ( expected_ti != pPid->EffectiveTi )
 		|| ( expected_td != pPid->EffectiveTd );
 	status->CoolingReverseHeatAllowed = pPid->CoolingReverseHeatAllowed;
 	status->CalculatedMV = pPid->CalculatedMV;
@@ -672,7 +675,8 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			const pid_gain_profile_st * const effective = PID_select_gain_profile( pInst );
 			const uint16_t profile_pb = effective ? effective->Pb : pCfg->Pb;
 			const uint16_t effective_pb = PID_apply_direction_pb( pInst, profile_pb );
-			const uint16_t effective_ti = effective ? effective->Ti : pCfg->Ti;
+			const uint16_t profile_ti = effective ? effective->Ti : pCfg->Ti;
+			const uint16_t effective_ti = PID_apply_direction_ti( pInst, profile_ti );
 			/* Near control is a standard PI controller for both directions. Keep
 			 * the PLC PB/Ti profile and suppress only D in the settling region. */
 			const uint16_t effective_td = ( PID_REGION_NEAR == pInst->Region )
@@ -788,6 +792,21 @@ static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st cons
 
 	const uint32_t scaled = ( uint32_t )pb * PID_COOLING_NEAR_PB_SCALE;
 	return ( scaled > UINT16_MAX ) ? UINT16_MAX : ( uint16_t )scaled;
+}
+
+/******************************************************************************
+ * @brief Restore the 27th-revision integral authority without restoring its
+ *        excessive proportional gain. Only cooling NEAR uses Ti=180 s.
+ ******************************************************************************/
+static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st const *pInst, uint16_t ti )
+{
+	if( pInst && ( PID_DIRECTION_COOLING == pInst->Direction )
+		&& ( PID_REGION_NEAR == pInst->Region ) && ( ti > 0U ) )
+	{
+		return PID_COOLING_NEAR_TI_RAW;
+	}
+
+	return ti;
 }
 
 /******************************************************************************

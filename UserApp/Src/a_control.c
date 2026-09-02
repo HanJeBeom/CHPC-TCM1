@@ -45,6 +45,7 @@
 #define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
 #define PID_COOLING_NEAR_PB_SCALE 2U
 #define PID_COOLING_NEAR_TI_RAW 2400U
+#define PID_FAR_TI_RAW 4800U
 #define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
 #define PID_PV_RATE_FILTER_TAU_S 5.0f
 #define PID_PREDICTION_HORIZON_S 30.0f
@@ -52,6 +53,8 @@
 #define PID_PREDICTIVE_HOLD_MAX_S 60.0f
 #define PID_PV_RATE_LIMIT_K_PER_S 1.0f
 #define PID_NEAR_INTEGRAL_HOLD_BAND_K 0.05f
+#define PID_FAR_INTEGRAL_LIMIT 0.35f
+#define PID_INTEGRAL_UNWIND_SCALE 4.0f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -675,6 +678,9 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			const bool near_entered = !setpoint_changed
 				&& ( PID_REGION_FAR == previous_region )
 				&& ( PID_REGION_NEAR == pInst->Region );
+			const bool near_exited = !setpoint_changed
+				&& ( PID_REGION_NEAR == previous_region )
+				&& ( PID_REGION_FAR == pInst->Region );
 			if( setpoint_changed )
 			{
 				/* A new demand starts with a clean integral; live PLC profile writes do not. */
@@ -692,6 +698,21 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				 * the signed PV rate predicts that braking should begin. */
 				pPid->PredictiveHoldElapsed = 0.0f;
 				pPid->PredictiveHoldActive = true;
+			}
+			else if( near_exited )
+			{
+				/* If inertia carries PV through SV and completely out of NEAR, do not
+				 * carry the old-direction integral back into FAR. Clearing only this
+				 * wrong-side fallback lets signed FAR P immediately command recovery. */
+				const bool exited_past_target =
+					( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( pInst->PV > pCfg->SV ) )
+					|| ( ( PID_DIRECTION_COOLING == pInst->Direction ) && ( pInst->PV < pCfg->SV ) );
+				if( exited_past_target )
+				{
+					pPid->I = 0.0f;
+					pPid->GainTransitionBias = 0.0f;
+					pPid->GainTransitionPending = false;
+				}
 			}
 
 			PID_cache_gain_profile( pInst, pCfg );
@@ -826,11 +847,17 @@ static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st cons
 }
 
 /******************************************************************************
- * @brief Restore the 27th-revision integral authority without restoring its
- *        excessive proportional gain. Only cooling NEAR uses Ti=180 s.
+ * @brief Keep PLC profile classification unchanged while applying internal
+ *        integral authority. FAR uses a weak 480 s integral in both directions;
+ *        cooling NEAR uses the validated 240 s integral.
  ******************************************************************************/
 static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st const *pInst, uint16_t ti )
 {
+	if( pInst && ( PID_REGION_FAR == pInst->Region ) )
+	{
+		return PID_FAR_TI_RAW;
+	}
+
 	if( pInst && ( PID_DIRECTION_COOLING == pInst->Direction )
 		&& ( PID_REGION_NEAR == pInst->Region ) && ( ti > 0U ) )
 	{
@@ -907,10 +934,13 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	float error = action * ( sp - pPID->PV_filtered );
 	const float predicted_pv = pPID->PV_filtered
 		+ ( pPID->PVRateFiltered * PID_PREDICTION_HORIZON_S );
-	const bool approaching_target = ( heating_near && ( pPID->PV_filtered < sp ) )
-		|| ( cooling_near && ( pPID->PV_filtered > sp ) );
-	const bool prediction_crossed_target = ( heating_near && ( predicted_pv >= sp ) )
-		|| ( cooling_near && ( predicted_pv <= sp ) );
+	const bool heating_control = ( COOL_CTRL_MODE != cool_heat );
+	const bool cooling_control = !heating_control;
+	const bool far_control = !heating_near && !cooling_near;
+	const bool approaching_target = ( heating_control && ( pPID->PV_filtered < sp ) )
+		|| ( cooling_control && ( pPID->PV_filtered > sp ) );
+	const bool prediction_crossed_target = ( heating_control && ( predicted_pv >= sp ) )
+		|| ( cooling_control && ( predicted_pv <= sp ) );
 	const float absolute_error = ( error < 0.0f ) ? -error : error;
 
 	/* Cooling alone uses the micro-band conditional integrator that passed the
@@ -976,10 +1006,18 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	// 수식: I[k+1] = I[k] + (Ki * error * Ts) + (Kb * (mv_final - mv_calc) * Ts)
 	// mv_final - mv_calc는 초과된 양(오차)을 의미합니다.
 	float Ki_term = 0.0f;
+	const bool integral_pushes_saturation = far_control
+		&& ( ( ( mv_calc >= pPID->u_max ) && ( error > 0.0f ) )
+			|| ( ( mv_calc <= pPID->u_min ) && ( error < 0.0f ) ) );
 	if( ( Ti > 0.0f ) && !hold_integral_growth
+		&& !integral_pushes_saturation
 		&& !( approaching_target && prediction_crossed_target ) )
 	{
 		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
+		if( integral_is_unwinding )
+		{
+			Ki_term *= PID_INTEGRAL_UNWIND_SCALE;
+		}
 	}
 
 	// Saturation 오차 (실제 출력 - 계산된 출력)
@@ -990,6 +1028,17 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 다음 주기를 위한 적분값 누적
 	pPID->I += Ki_term + back_calc_term;
+	if( far_control )
+	{
+		if( pPID->I > PID_FAR_INTEGRAL_LIMIT )
+		{
+			pPID->I = PID_FAR_INTEGRAL_LIMIT;
+		}
+		else if( pPID->I < -PID_FAR_INTEGRAL_LIMIT )
+		{
+			pPID->I = -PID_FAR_INTEGRAL_LIMIT;
+		}
+	}
 
 	/* Both directions use the existing FAR-to-NEAR transition bias and delay its
 	 * decay only while the signed PV rate predicts that PV is still safely on
@@ -1150,8 +1199,9 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
  * @brief Apply the profile selected by the internal FAR/NEAR state while
  *        preserving the running PID state.
  *
- * Ti=0 selects P-only calculation but does not delete the stored integral.
- * Integral reset is owned by run/setpoint state changes, not PLC profile writes.
+ * PLC Ti=0 still identifies the FAR profile; PID_apply_direction_ti converts it
+ * to the internal FAR Ti before this function. Integral reset is owned by
+ * run/setpoint state changes, not PLC profile writes.
  ******************************************************************************/
 static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg,
 	uint16_t effective_pb_raw, uint16_t effective_ti_raw, uint16_t effective_td_raw )

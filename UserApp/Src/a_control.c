@@ -42,9 +42,14 @@
 #define PID_HEATING_NEAR_ENTER_ERROR_K 1.0f
 #define PID_COOLING_NEAR_ENTER_ERROR_K 1.0f
 #define PID_HEATING_NEAR_TI_RAW 1200U
+#define PID_HEATING_FAR_PB_SCALE 2U
 #define PID_COOLING_NEAR_PB_SCALE 2U
 #define PID_COOLING_I_UNWIND_ERROR_K 0.05f
 #define PID_COOLING_I_UNWIND_SCALE 4.0f
+#define PID_HEATING_RATE_FILTER_TAU_S 4.0f
+#define PID_HEATING_PREDICTION_HORIZON_S 4.0f
+#define PID_HEATING_PREDICTION_MARGIN_K 0.2f
+#define PID_HEATING_MIN_RISE_RATE_KPS 0.01f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -77,6 +82,12 @@ typedef struct control_loop_instance_Tag
 	float filter_alpha;
 	int32_t directionSV;
 	bool directionInited;
+	float heatingRatePrevPV;
+	float heatingRateFiltered;
+	float heatingPredictedPV;
+	bool heatingRateInited;
+	bool heatingPredictiveEntry;
+	bool heatingPredictiveBrakeActive;
 	enum
 	{
 		PID_DIRECTION_HEATING = 0,
@@ -176,7 +187,7 @@ static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_lo
 static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st const *pInst, uint16_t pb );
 static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st const *pInst, uint16_t ti );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
-	cool_heat_mode_et cool_heat, bool cooling_near );
+	cool_heat_mode_et cool_heat, bool cooling_near, bool heating_integral_hold );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
 
@@ -685,16 +696,16 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				( PID_REGION_NEAR == pInst->Region )
 				&& ( 0U == pPid->EffectiveTi )
 				&& ( effective_ti > 0U );
-			const float previous_applied_mv = pPid->AppliedMV;
 			PID_instance_UpdateGains( pPid, pCfg, effective_pb, effective_ti, effective_td );
 			if( far_to_near_integral )
 			{
 				if( PID_DIRECTION_HEATING == pInst->Direction )
 				{
-					/* Heating needs the previous output to avoid losing the holding
-					 * load when PB increases. Normal I owns all following samples. */
-					pPid->BumplessTargetMV = previous_applied_mv;
-					pPid->BumplessPending = true;
+					/* Heating must brake at every NEAR entry. The FAR demand is
+					 * approach power, not a valid steady-state integral preload. */
+					pPid->I = 0.0f;
+					pPid->BumplessPending = false;
+					pInst->heatingPredictiveEntry = false;
 				}
 				else
 				{
@@ -708,8 +719,11 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
 			const bool cooling_near = ( PID_DIRECTION_COOLING == pInst->Direction )
 				&& ( PID_REGION_NEAR == pInst->Region );
+			const bool heating_integral_hold = pInst->heatingPredictiveBrakeActive
+				&& ( pInst->heatingPredictedPV >= ( sp - PID_HEATING_PREDICTION_MARGIN_K ) )
+				&& ( pv < sp );
 			pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat,
-				cooling_near );
+				cooling_near, heating_integral_hold );
 			retval = 1;
 		}
 	}
@@ -744,15 +758,52 @@ static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pIn
 		setpoint_changed = true;
 	}
 
-	const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
+	const float dt = ( ( pCfg->ControlPeriod < MIN_CONTROL_PERIOD )
+		? MIN_CONTROL_PERIOD : pCfg->ControlPeriod ) * MULTIPLY_ms_TO_s;
+	const float pv = pInst->PV * MULTIPLY_mK_TO_K;
+	const float sv = pCfg->SV * MULTIPLY_mK_TO_K;
 	const bool heating = ( PID_DIRECTION_HEATING == pInst->Direction );
+	if( setpoint_changed || !pInst->heatingRateInited || !heating )
+	{
+		/* Prediction state belongs only to the active heating demand. */
+		pInst->heatingRatePrevPV = pv;
+		pInst->heatingRateFiltered = 0.0f;
+		pInst->heatingPredictedPV = pv;
+		pInst->heatingRateInited = heating;
+		pInst->heatingPredictiveEntry = false;
+		pInst->heatingPredictiveBrakeActive = false;
+	}
+	else
+	{
+		const float raw_rate = ( pv - pInst->heatingRatePrevPV ) / dt;
+		const float rate_alpha = dt / ( PID_HEATING_RATE_FILTER_TAU_S + dt );
+		pInst->heatingRateFiltered += rate_alpha
+			* ( raw_rate - pInst->heatingRateFiltered );
+		pInst->heatingRatePrevPV = pv;
+		pInst->heatingPredictedPV = pv
+			+ fmaxf( pInst->heatingRateFiltered, 0.0f )
+				* PID_HEATING_PREDICTION_HORIZON_S;
+		if( pInst->heatingPredictiveBrakeActive && ( pv >= sv ) )
+		{
+			/* Actual SV crossing ends the heating-only integral hold. */
+			pInst->heatingPredictiveBrakeActive = false;
+		}
+	}
+
+	const float abs_error = fabsf( ( pCfg->SV - pInst->PV ) * MULTIPLY_mK_TO_K );
 	const float near_enter_error = heating ? PID_HEATING_NEAR_ENTER_ERROR_K
 		: PID_COOLING_NEAR_ENTER_ERROR_K;
 	if( PID_REGION_FAR == pInst->Region )
 	{
-		if( abs_error <= near_enter_error )
+		const bool predictive_heating_entry = heating
+			&& ( abs_error > near_enter_error )
+			&& ( pInst->heatingRateFiltered > PID_HEATING_MIN_RISE_RATE_KPS )
+			&& ( pInst->heatingPredictedPV >= ( sv - PID_HEATING_PREDICTION_MARGIN_K ) );
+		if( ( abs_error <= near_enter_error ) || predictive_heating_entry )
 		{
 			pInst->Region = PID_REGION_NEAR;
+			pInst->heatingPredictiveEntry = predictive_heating_entry;
+			pInst->heatingPredictiveBrakeActive = predictive_heating_entry;
 		}
 	}
 
@@ -789,19 +840,30 @@ static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_lo
 }
 
 /******************************************************************************
- * @brief Apply the single 28th-revision gain schedule. Cooling has a lower
- *        process gain margin near SV, so double PB (halve Kp and Ki) only in
- *        cooling NEAR. The PLC profile itself remains unchanged.
+ * @brief Apply direction/region-only PB scaling without changing PLC data.
+ *        Heating FAR doubles PB to reduce stored heat before NEAR. Cooling
+ *        NEAR retains its validated doubled PB for stability.
  ******************************************************************************/
 static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st const *pInst, uint16_t pb )
 {
-	if( !pInst || ( PID_DIRECTION_COOLING != pInst->Direction )
-		|| ( PID_REGION_NEAR != pInst->Region ) )
+	if( !pInst )
 	{
 		return pb;
 	}
 
-	const uint32_t scaled = ( uint32_t )pb * PID_COOLING_NEAR_PB_SCALE;
+	uint32_t scale = 1U;
+	if( ( PID_DIRECTION_HEATING == pInst->Direction )
+		&& ( PID_REGION_FAR == pInst->Region ) )
+	{
+		scale = PID_HEATING_FAR_PB_SCALE;
+	}
+	else if( ( PID_DIRECTION_COOLING == pInst->Direction )
+		&& ( PID_REGION_NEAR == pInst->Region ) )
+	{
+		scale = PID_COOLING_NEAR_PB_SCALE;
+	}
+
+	const uint32_t scaled = ( uint32_t )pb * scale;
 	return ( scaled > UINT16_MAX ) ? UINT16_MAX : ( uint16_t )scaled;
 }
 
@@ -829,7 +891,7 @@ static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st cons
  * @return Manipulated Value (MV)
  ******************************************************************************/
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
-	cool_heat_mode_et cool_heat, bool cooling_near )
+	cool_heat_mode_et cool_heat, bool cooling_near, bool heating_integral_hold )
 {
 	/****************************************************************************
 	InputFilterCoeff filters PV only. P and I use the true setpoint error against
@@ -926,7 +988,7 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	const bool integral_pushes_saturation =
 		( ( ( mv_calc >= pPID->u_max ) && ( error > 0.0f ) )
 			|| ( ( mv_calc <= pPID->u_min ) && ( error < 0.0f ) ) );
-	if( ( Ti > 0.0f ) && !integral_pushes_saturation )
+	if( ( Ti > 0.0f ) && !integral_pushes_saturation && !heating_integral_hold )
 	{
 		float integral_scale = 1.0f;
 		if( cooling_near

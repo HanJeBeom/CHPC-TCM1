@@ -43,6 +43,8 @@
 #define PID_COOLING_NEAR_ENTER_ERROR_K 1.0f
 #define PID_HEATING_NEAR_TI_RAW 1200U
 #define PID_COOLING_NEAR_PB_SCALE 2U
+#define PID_COOLING_I_UNWIND_ERROR_K 0.05f
+#define PID_COOLING_I_UNWIND_SCALE 4.0f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -687,10 +689,20 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			PID_instance_UpdateGains( pPid, pCfg, effective_pb, effective_ti, effective_td );
 			if( far_to_near_integral )
 			{
-				/* Preserve only the output at the actual FAR(Ti=0)->NEAR(Ti>0)
-				 * gain change. The normal integrator owns all following samples. */
-				pPid->BumplessTargetMV = previous_applied_mv;
-				pPid->BumplessPending = true;
+				if( PID_DIRECTION_HEATING == pInst->Direction )
+				{
+					/* Heating needs the previous output to avoid losing the holding
+					 * load when PB increases. Normal I owns all following samples. */
+					pPid->BumplessTargetMV = previous_applied_mv;
+					pPid->BumplessPending = true;
+				}
+				else
+				{
+					/* Cooling must brake at NEAR entry. Do not convert the FAR
+					 * cooling demand into a long-lived NEAR integral preload. */
+					pPid->I = 0.0f;
+					pPid->BumplessPending = false;
+				}
 			}
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
@@ -916,7 +928,16 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 			|| ( ( mv_calc <= pPID->u_min ) && ( error < 0.0f ) ) );
 	if( ( Ti > 0.0f ) && !integral_pushes_saturation )
 	{
-		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
+		float integral_scale = 1.0f;
+		if( cooling_near
+			&& ( error < -PID_COOLING_I_UNWIND_ERROR_K )
+			&& ( pPID->I > 0.0f ) )
+		{
+			/* Below SV, remove residual positive cooling I faster. Stop the
+			 * acceleration inside 0.05 K and as soon as cooling I is gone. */
+			integral_scale = PID_COOLING_I_UNWIND_SCALE;
+		}
+		Ki_term = ( pPID->Kp / Ti ) * error * Ts * integral_scale;
 	}
 
 	// Saturation 오차 (실제 출력 - 계산된 출력)

@@ -40,21 +40,9 @@
 #define ERROR_VALUE_I_TERM_WINDING 40.0f
 
 #define PID_HEATING_NEAR_ENTER_ERROR_K 1.0f
-#define PID_HEATING_NEAR_EXIT_ERROR_K 1.3f
 #define PID_COOLING_NEAR_ENTER_ERROR_K 1.0f
-#define PID_COOLING_NEAR_EXIT_ERROR_K 1.3f
+#define PID_HEATING_NEAR_TI_RAW 1200U
 #define PID_COOLING_NEAR_PB_SCALE 2U
-#define PID_COOLING_NEAR_TI_RAW 2400U
-#define PID_FAR_TI_RAW 4800U
-#define PID_GAIN_TRANSITION_BIAS_TAU_S 8.0f
-#define PID_PV_RATE_FILTER_TAU_S 5.0f
-#define PID_PREDICTION_HORIZON_S 30.0f
-#define PID_PREDICTION_MARGIN_K 0.05f
-#define PID_PREDICTIVE_HOLD_MAX_S 60.0f
-#define PID_PV_RATE_LIMIT_K_PER_S 1.0f
-#define PID_NEAR_INTEGRAL_HOLD_BAND_K 0.05f
-#define PID_FAR_INTEGRAL_LIMIT 0.35f
-#define PID_INTEGRAL_UNWIND_SCALE 4.0f
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -147,12 +135,8 @@ typedef struct {
 
 	// Anti-windup gain
 	float Kaw;
-	float GainTransitionBias;
-	float GainTransitionTargetMV;
-	bool GainTransitionPending;
-	float PVRateFiltered;
-	float PredictiveHoldElapsed;
-	bool PredictiveHoldActive;
+	float BumplessTargetMV;
+	bool BumplessPending;
 	bool CoolingReverseHeatAllowed;
 
 	/* Diagnostic mirrors; these fields do not participate in PID calculation. */
@@ -190,7 +174,7 @@ static __RAM_FUNC const pid_gain_profile_st *PID_select_gain_profile( control_lo
 static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st const *pInst, uint16_t pb );
 static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st const *pInst, uint16_t ti );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
-	cool_heat_mode_et cool_heat, bool cooling_near, bool heating_near );
+	cool_heat_mode_et cool_heat, bool cooling_near );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
 
@@ -437,9 +421,12 @@ static bool control_loop_get_pid_diagnostic_status( int loop_idx, pid_diagnostic
 	const pid_st * const pPid = &pid_inst[ loop_idx ];
 	const control_loop_instance_st * const pInst = &ControllerVars.Inst[ loop_idx ];
 	const control_loop_config_st * const pCfg = &ControllerVars.Cfg[ loop_idx ];
-	const uint16_t expected_pb = PID_apply_direction_pb( pInst, pCfg->Pb );
-	const uint16_t expected_ti = PID_apply_direction_ti( pInst, pCfg->Ti );
-	const uint16_t expected_td = ( PID_REGION_NEAR == pInst->Region ) ? 0U : pCfg->Td;
+	const pid_gain_profile_st * const effective = PID_select_gain_profile( pInst );
+	const uint16_t profile_pb = effective ? effective->Pb : pCfg->Pb;
+	const uint16_t expected_pb = PID_apply_direction_pb( pInst, profile_pb );
+	const uint16_t profile_ti = effective ? effective->Ti : pCfg->Ti;
+	const uint16_t expected_ti = PID_apply_direction_ti( pInst, profile_ti );
+	const uint16_t expected_td = effective ? effective->Td : pCfg->Td;
 	status->EffectivePb = pPid->EffectivePb;
 	status->EffectiveTi = pPid->EffectiveTi;
 	status->EffectiveTd = pPid->EffectiveTd;
@@ -673,46 +660,13 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		else
 		{
 			pid_st * const pPid = &pid_inst[ pInst->CH ];
-			const uint16_t previous_region = ( uint16_t )pInst->Region;
 			const bool setpoint_changed = PID_update_operating_state( pInst, pCfg );
-			const bool near_entered = !setpoint_changed
-				&& ( PID_REGION_FAR == previous_region )
-				&& ( PID_REGION_NEAR == pInst->Region );
-			const bool near_exited = !setpoint_changed
-				&& ( PID_REGION_NEAR == previous_region )
-				&& ( PID_REGION_FAR == pInst->Region );
 			if( setpoint_changed )
 			{
-				/* A new demand starts with a clean integral; live PLC profile writes do not. */
+				/* A new demand starts with a clean integral. */
 				pPid->I = 0.0f;
-				pPid->GainTransitionBias = 0.0f;
-				pPid->GainTransitionPending = false;
-				pPid->PVRateFiltered = 0.0f;
-				pPid->PredictiveHoldElapsed = 0.0f;
-				pPid->PredictiveHoldActive = false;
+				pPid->BumplessPending = false;
 				pPid->CoolingReverseHeatAllowed = false;
-			}
-			else if( near_entered )
-			{
-				/* Retain only the existing FAR-to-NEAR transition correction until
-				 * the signed PV rate predicts that braking should begin. */
-				pPid->PredictiveHoldElapsed = 0.0f;
-				pPid->PredictiveHoldActive = true;
-			}
-			else if( near_exited )
-			{
-				/* If inertia carries PV through SV and completely out of NEAR, do not
-				 * carry the old-direction integral back into FAR. Clearing only this
-				 * wrong-side fallback lets signed FAR P immediately command recovery. */
-				const bool exited_past_target =
-					( ( PID_DIRECTION_HEATING == pInst->Direction ) && ( pInst->PV > pCfg->SV ) )
-					|| ( ( PID_DIRECTION_COOLING == pInst->Direction ) && ( pInst->PV < pCfg->SV ) );
-				if( exited_past_target )
-				{
-					pPid->I = 0.0f;
-					pPid->GainTransitionBias = 0.0f;
-					pPid->GainTransitionPending = false;
-				}
 			}
 
 			PID_cache_gain_profile( pInst, pCfg );
@@ -721,30 +675,29 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 			const uint16_t effective_pb = PID_apply_direction_pb( pInst, profile_pb );
 			const uint16_t profile_ti = effective ? effective->Ti : pCfg->Ti;
 			const uint16_t effective_ti = PID_apply_direction_ti( pInst, profile_ti );
-			/* Near control is a standard PI controller for both directions. Keep
-			 * the PLC PB/Ti profile and suppress only D in the settling region. */
-			const uint16_t effective_td = ( PID_REGION_NEAR == pInst->Region )
-				? 0U : ( effective ? effective->Td : pCfg->Td );
+			/* Use derivative-on-filtered-PV in NEAR as well. The PLC-provided Td
+			 * adds phase damping without derivative kick because SV is not differentiated. */
+			const uint16_t effective_td = effective ? effective->Td : pCfg->Td;
 
+			const bool far_to_near_integral =
+				( PID_REGION_NEAR == pInst->Region )
+				&& ( 0U == pPid->EffectiveTi )
+				&& ( effective_ti > 0U );
+			const float previous_applied_mv = pPid->AppliedMV;
 			PID_instance_UpdateGains( pPid, pCfg, effective_pb, effective_ti, effective_td );
-			if( setpoint_changed )
+			if( far_to_near_integral )
 			{
-				/* Do not transfer the old demand's output into a new setpoint. */
-				pPid->GainTransitionPending = false;
+				/* Preserve only the output at the actual FAR(Ti=0)->NEAR(Ti>0)
+				 * gain change. The normal integrator owns all following samples. */
+				pPid->BumplessTargetMV = previous_applied_mv;
+				pPid->BumplessPending = true;
 			}
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
 			const bool cooling_near = ( PID_DIRECTION_COOLING == pInst->Direction )
 				&& ( PID_REGION_NEAR == pInst->Region );
-			const bool heating_near = ( PID_DIRECTION_HEATING == pInst->Direction )
-				&& ( PID_REGION_NEAR == pInst->Region );
-			if( !heating_near && !cooling_near )
-			{
-				pPid->PredictiveHoldElapsed = 0.0f;
-				pPid->PredictiveHoldActive = false;
-			}
 			pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat,
-				cooling_near, heating_near );
+				cooling_near );
 			retval = 1;
 		}
 	}
@@ -754,8 +707,8 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 /******************************************************************************
  * @brief Latch the SV-change direction and update the FAR/NEAR region.
  *
- * Direction changes only when SV changes.  Region uses separate enter/exit
- * thresholds so measurement noise cannot repeatedly switch the effective Ti.
+ * Direction and FAR restart only when SV changes. Once the active demand enters
+ * NEAR it remains there so approach gain cannot re-excite a settling oscillation.
  ******************************************************************************/
 static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pInst, control_loop_config_st const *pCfg )
 {
@@ -783,18 +736,12 @@ static __RAM_FUNC bool PID_update_operating_state( control_loop_instance_st *pIn
 	const bool heating = ( PID_DIRECTION_HEATING == pInst->Direction );
 	const float near_enter_error = heating ? PID_HEATING_NEAR_ENTER_ERROR_K
 		: PID_COOLING_NEAR_ENTER_ERROR_K;
-	const float near_exit_error = heating ? PID_HEATING_NEAR_EXIT_ERROR_K
-		: PID_COOLING_NEAR_EXIT_ERROR_K;
 	if( PID_REGION_FAR == pInst->Region )
 	{
 		if( abs_error <= near_enter_error )
 		{
 			pInst->Region = PID_REGION_NEAR;
 		}
-	}
-	else if( abs_error >= near_exit_error )
-	{
-		pInst->Region = PID_REGION_FAR;
 	}
 
 	return setpoint_changed;
@@ -847,21 +794,15 @@ static __RAM_FUNC uint16_t PID_apply_direction_pb( control_loop_instance_st cons
 }
 
 /******************************************************************************
- * @brief Keep PLC profile classification unchanged while applying internal
- *        integral authority. FAR uses a weak 480 s integral in both directions;
- *        cooling NEAR uses the validated 240 s integral.
+ * @brief Use the validated 120 s integral time only for heating NEAR.
+ *        FAR Ti=0 and cooling NEAR PLC Ti remain unchanged.
  ******************************************************************************/
 static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st const *pInst, uint16_t ti )
 {
-	if( pInst && ( PID_REGION_FAR == pInst->Region ) )
-	{
-		return PID_FAR_TI_RAW;
-	}
-
-	if( pInst && ( PID_DIRECTION_COOLING == pInst->Direction )
+	if( pInst && ( PID_DIRECTION_HEATING == pInst->Direction )
 		&& ( PID_REGION_NEAR == pInst->Region ) && ( ti > 0U ) )
 	{
-		return PID_COOLING_NEAR_TI_RAW;
+		return PID_HEATING_NEAR_TI_RAW;
 	}
 
 	return ti;
@@ -876,7 +817,7 @@ static __RAM_FUNC uint16_t PID_apply_direction_ti( control_loop_instance_st cons
  * @return Manipulated Value (MV)
  ******************************************************************************/
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv,
-	cool_heat_mode_et cool_heat, bool cooling_near, bool heating_near )
+	cool_heat_mode_et cool_heat, bool cooling_near )
 {
 	/****************************************************************************
 	InputFilterCoeff filters PV only. P and I use the true setpoint error against
@@ -887,8 +828,6 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	float Ti = pPID->Ti;
 	float Ts = pPID->Ts;
 	float alpha = pPID->alpha;
-	const bool pv_filter_was_inited = pPID->PVFilterInited;
-	const float previous_filtered_pv = pPID->PV_filtered;
 
 	/* 1. First-order low-pass filter on the measured PV. Raw 0 bypasses the
 	 * filter; raw 100 follows the current sample directly. */
@@ -908,48 +847,9 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		pPID->PV_filtered += alpha * ( pv - pPID->PV_filtered );
 	}
 
-	/* Estimate physical heating rate from the already filtered PV. A separate
-	 * five-second low-pass keeps sample noise from moving the braking point. */
-	if( pv_filter_was_inited && ( Ts > 0.0f ) )
-	{
-		float raw_pv_rate = ( pPID->PV_filtered - previous_filtered_pv ) / Ts;
-		if( raw_pv_rate > PID_PV_RATE_LIMIT_K_PER_S )
-		{
-			raw_pv_rate = PID_PV_RATE_LIMIT_K_PER_S;
-		}
-		else if( raw_pv_rate < -PID_PV_RATE_LIMIT_K_PER_S )
-		{
-			raw_pv_rate = -PID_PV_RATE_LIMIT_K_PER_S;
-		}
-		const float rate_alpha = Ts / ( PID_PV_RATE_FILTER_TAU_S + Ts );
-		pPID->PVRateFiltered += rate_alpha * ( raw_pv_rate - pPID->PVRateFiltered );
-	}
-	else
-	{
-		pPID->PVRateFiltered = 0.0f;
-	}
-
 	/* 2. P and I use the real SV error; Ti no longer delays the setpoint. */
 	float action = ( COOL_CTRL_MODE == cool_heat ) ? -1.0f : 1.0f;
 	float error = action * ( sp - pPID->PV_filtered );
-	const float predicted_pv = pPID->PV_filtered
-		+ ( pPID->PVRateFiltered * PID_PREDICTION_HORIZON_S );
-	const bool heating_control = ( COOL_CTRL_MODE != cool_heat );
-	const bool cooling_control = !heating_control;
-	const bool far_control = !heating_near && !cooling_near;
-	const bool approaching_target = ( heating_control && ( pPID->PV_filtered < sp ) )
-		|| ( cooling_control && ( pPID->PV_filtered > sp ) );
-	const bool prediction_crossed_target = ( heating_control && ( predicted_pv >= sp ) )
-		|| ( cooling_control && ( predicted_pv <= sp ) );
-	const float absolute_error = ( error < 0.0f ) ? -error : error;
-
-	/* Cooling alone uses the micro-band conditional integrator that passed the
-	 * 37th long-run test. Heating keeps normal PI authority near SV so its
-	 * required holding output recovers immediately when PV falls below target. */
-	const bool near_micro_band = cooling_near
-		&& ( absolute_error <= PID_NEAR_INTEGRAL_HOLD_BAND_K );
-	const bool integral_is_unwinding = ( pPID->I * error ) < 0.0f;
-	const bool hold_integral_growth = near_micro_band && !integral_is_unwinding;
 
 	/* 3. Proportional term (2DOF setpoint weight beta=1). */
 	float P_term = pPID->Kp * error;
@@ -972,15 +872,20 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 5. 계산된 조작량 (Calculated MV) - 아직 제한 전
 	// 주의: 적분항은 '이전 스텝까지 누적된 값(I)'을 사용합니다.
-	/* Match the previous applied output on a live FAR/NEAR gain change. The
-	 * temporary bias then decays instead of becoming a long-lived I preload. */
-	const float pid_base = P_term + ( ( Ti > 0.0f ) ? pPID->I : 0.0f ) - ( action * D_term );
-	if( pPID->GainTransitionPending )
+	/* One-shot bumpless transfer when the actual FAR(Ti=0)->NEAR(Ti>0)
+	 * profile change arrives. This is integral initialization, not a timed bias. */
+	const float pd_term = P_term - ( action * D_term );
+	if( pPID->BumplessPending )
 	{
-		pPID->GainTransitionBias = pPID->GainTransitionTargetMV - pid_base;
-		pPID->GainTransitionPending = false;
+		if( Ti > 0.0f )
+		{
+			pPID->I = pPID->BumplessTargetMV - pd_term;
+		}
+		pPID->BumplessPending = false;
 	}
-	float mv_calc = pid_base + pPID->GainTransitionBias;
+
+	/* Standard PID sum after the one-shot initialization. */
+	float mv_calc = pd_term + ( ( Ti > 0.0f ) ? pPID->I : 0.0f );
 
 	// 6. 출력 제한 (Saturation) 및 실제 조작량 결정
 	float mv_final = mv_calc;
@@ -1006,18 +911,12 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	// 수식: I[k+1] = I[k] + (Ki * error * Ts) + (Kb * (mv_final - mv_calc) * Ts)
 	// mv_final - mv_calc는 초과된 양(오차)을 의미합니다.
 	float Ki_term = 0.0f;
-	const bool integral_pushes_saturation = far_control
-		&& ( ( ( mv_calc >= pPID->u_max ) && ( error > 0.0f ) )
+	const bool integral_pushes_saturation =
+		( ( ( mv_calc >= pPID->u_max ) && ( error > 0.0f ) )
 			|| ( ( mv_calc <= pPID->u_min ) && ( error < 0.0f ) ) );
-	if( ( Ti > 0.0f ) && !hold_integral_growth
-		&& !integral_pushes_saturation
-		&& !( approaching_target && prediction_crossed_target ) )
+	if( ( Ti > 0.0f ) && !integral_pushes_saturation )
 	{
 		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
-		if( integral_is_unwinding )
-		{
-			Ki_term *= PID_INTEGRAL_UNWIND_SCALE;
-		}
 	}
 
 	// Saturation 오차 (실제 출력 - 계산된 출력)
@@ -1028,61 +927,6 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 
 	// 다음 주기를 위한 적분값 누적
 	pPID->I += Ki_term + back_calc_term;
-	if( far_control )
-	{
-		if( pPID->I > PID_FAR_INTEGRAL_LIMIT )
-		{
-			pPID->I = PID_FAR_INTEGRAL_LIMIT;
-		}
-		else if( pPID->I < -PID_FAR_INTEGRAL_LIMIT )
-		{
-			pPID->I = -PID_FAR_INTEGRAL_LIMIT;
-		}
-	}
-
-	/* Both directions use the existing FAR-to-NEAR transition bias and delay its
-	 * decay only while the signed PV rate predicts that PV is still safely on
-	 * the approach side of SV. This is relative to the active SV and therefore
-	 * applies at every target temperature. */
-	bool hold_transition_bias = false;
-	if( ( heating_near || cooling_near ) && pPID->PredictiveHoldActive )
-	{
-		pPID->PredictiveHoldElapsed += Ts;
-		const bool bias_assists_approach = ( pPID->GainTransitionBias * error ) > 0.0f;
-		const bool actual_target_crossed = ( heating_near && ( pPID->PV_filtered >= sp ) )
-			|| ( cooling_near && ( pPID->PV_filtered <= sp ) );
-		const bool prediction_before_brake = ( heating_near
-			&& ( predicted_pv < ( sp - PID_PREDICTION_MARGIN_K ) ) )
-			|| ( cooling_near
-				&& ( predicted_pv > ( sp + PID_PREDICTION_MARGIN_K ) ) );
-
-		if( actual_target_crossed )
-		{
-			/* The prediction should release first; this is the hard safety stop. */
-			pPID->GainTransitionBias = 0.0f;
-			pPID->PredictiveHoldActive = false;
-		}
-		else if( bias_assists_approach && prediction_before_brake
-			&& ( pPID->PredictiveHoldElapsed < PID_PREDICTIVE_HOLD_MAX_S ) )
-		{
-			hold_transition_bias = true;
-		}
-		else
-		{
-			pPID->PredictiveHoldActive = false;
-		}
-	}
-
-	/* Outside the bounded predictive hold, remove the temporary correction with
-	 * the existing 8 s time constant. */
-	if( !hold_transition_bias && ( PID_GAIN_TRANSITION_BIAS_TAU_S > Ts ) )
-	{
-		pPID->GainTransitionBias *= 1.0f - ( Ts / PID_GAIN_TRANSITION_BIAS_TAU_S );
-	}
-	else if( !hold_transition_bias )
-	{
-		pPID->GainTransitionBias = 0.0f;
-	}
 
 	// 8. 다음 스텝을 위해 현재 상태 저장
 	pPID->SP_ref_prev = sp;
@@ -1186,12 +1030,8 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->EffectiveInputFilterCoeff = pCfg->InputFilterCoeff;
 	pPid->CalculatedMV = 0.0f;
 	pPid->AppliedMV = 0.0f;
-	pPid->GainTransitionBias = 0.0f;
-	pPid->GainTransitionTargetMV = 0.0f;
-	pPid->GainTransitionPending = false;
-	pPid->PVRateFiltered = 0.0f;
-	pPid->PredictiveHoldElapsed = 0.0f;
-	pPid->PredictiveHoldActive = false;
+	pPid->BumplessTargetMV = 0.0f;
+	pPid->BumplessPending = false;
 	pPid->CoolingReverseHeatAllowed = false;
 }
 
@@ -1199,9 +1039,8 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
  * @brief Apply the profile selected by the internal FAR/NEAR state while
  *        preserving the running PID state.
  *
- * PLC Ti=0 still identifies the FAR profile; PID_apply_direction_ti converts it
- * to the internal FAR Ti before this function. Integral reset is owned by
- * run/setpoint state changes, not PLC profile writes.
+ * PLC PB/Ti/Td are applied directly. Integral reset is owned by run/setpoint
+ * state changes, not PLC profile writes.
  ******************************************************************************/
 static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg,
 	uint16_t effective_pb_raw, uint16_t effective_ti_raw, uint16_t effective_td_raw )
@@ -1218,11 +1057,6 @@ static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_conf
 	pPid->EffectiveInputFilterCoeff = pCfg->InputFilterCoeff;
 
 	if( ( pPid->Kp == kp ) && ( pPid->Ti == ti ) && ( pPid->Td == td ) && ( pPid->alpha == alpha ) ) return;
-
-	/* The next PID sample computes a bias against the new P/I/D terms so the
-	 * applied output begins at the previous sample instead of jumping. */
-	pPid->GainTransitionTargetMV = pPid->AppliedMV;
-	pPid->GainTransitionPending = true;
 
 	pPid->Kp = kp;
 	pPid->Ti = ti;

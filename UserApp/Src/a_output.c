@@ -38,7 +38,7 @@
 #define SMPS_CMD_STATUS_RESET		( 1 << 2 )
 #define SMPS_DEFAULT_CH_ON			( 0xf << 3 )
 
-#define ENABLE_TRANSFER_FUNCTION_FOR_SMPS_LOW_POWER_RANGE_AND_RESPONSE_DELAY	( 1 )
+#define ENABLE_TRANSFER_FUNCTION_FOR_SMPS_LOW_POWER_RANGE_AND_RESPONSE_DELAY	( 0 )
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/

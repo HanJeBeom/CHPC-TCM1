@@ -67,24 +67,23 @@ typedef enum __packed output_type_enum_Tag
 
 typedef enum __packed control_type_enum_Tag
 {
-	/* Selectable by PLC: controllers using PLC gains */
+	/* Selectable by PLC. CONTROL_TYPE_USES_PLC_GAIN tells which ones use PLC gains. */
 	CTRL_PID = 0,			// 0: General PID (no setpoint filter)
 	CTRL_2DOF_PID,			// 1: 2-DoF PID (setpoint filter)
 	CTRL_PID_PROD,			// 2: Production PID (formula of GitLab chpc-tcm1 main)
 	CTRL_PI_COND_I,			// 3: PI with conditional integration
 	CTRL_PI_SV_RATE,		// 4: PI with setpoint rate limit
-	CTRL_PI_GS,				// 5: Gain-scheduled PI
-
-	/* Selectable by PLC: no PLC gains */
+	CTRL_PI_GS,				// 5: Gain-scheduled PI by SV
 	CTRL_PI_ADAPTIVE,		// 6: Adaptive PI (gains decided by firmware)
-	CTRL_ONOFF,				// 7: On/Off
-	CTRL_BYPASS,			// 8: MV from PLC
+	CTRL_PI_GS_ERR,			// 7: Gain-scheduled PI by SV-PV error
+	CTRL_ONOFF,				// 8: On/Off
+	CTRL_BYPASS,			// 9: MV from PLC
 
 	/* Not selectable by PLC */
-	CTRL_SLIDING,			// 9
-	CTRL_NN,				// 10
-	CTRL_FULL_TEST,			// 11
-	CTRL_HALF_TEST,			// 12
+	CTRL_SLIDING,			// 10
+	CTRL_NN,				// 11
+	CTRL_FULL_TEST,			// 12
+	CTRL_HALF_TEST,			// 13
 
 	control_et_max = 0xffff
 } control_et;
@@ -139,7 +138,7 @@ typedef struct __packed control_loop_config_struct_Tag
 	int16_t OutputMin;              // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	uint16_t PWMFreq;               // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	uint16_t OutputDelay;           // default: 0         / Range: 0 ~ 999 (sec)
-	control_et ControlType:16;      // default: PID       / Range: 0 ~ 8 ( control_et )
+	control_et ControlType:16;      // default: PID       / Range: 0 ~ 9 ( control_et )
 	cool_heat_mode_et CoolHeat:16;  // default: Cool      / Range: COOL : 0, Heat : 1
 	uint16_t StartDelay;            // default: 10        / Range: 0 ~ 999 (sec)
 	uint16_t SmpsLeakageCurrent;    // default: 100       / Range: 0 ~ 65535 (mA)

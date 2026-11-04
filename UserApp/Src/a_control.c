@@ -42,7 +42,7 @@
 /* CTRL_PI_SV_RATE. Provisional value: replace after measuring the plant rise rate. */
 #define SV_RATE_DEGC_PER_SEC 0.5f
 
-/* CTRL_PI_GS. Number of SV points in gs_sv_points and the multiplier tables. */
+/* CTRL_PI_GS, CTRL_PI_GS_ERR. Number of points in each schedule table. */
 #define GS_POINT_COUNT 4
 
 /* CTRL_PI_ADAPTIVE. Provisional values: replace after measuring the plant. */
@@ -231,8 +231,9 @@ static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mo
 static __RAM_FUNC void PID_instance_Start( pid_st *pPid, float pv );
 static __RAM_FUNC float PID_production_calculate( pid_st *pPid, control_loop_config_st const *pCfg, control_loop_instance_st *pInst, float dt, float sp, float pv );
 static __RAM_FUNC float PI_sv_rate_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
-static __RAM_FUNC float gs_interpolate( float const table[ GS_POINT_COUNT ], float sv );
+static __RAM_FUNC float gs_interpolate( float const points[ GS_POINT_COUNT ], float const table[ GS_POINT_COUNT ], float x );
 static __RAM_FUNC float PI_gain_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC float PI_error_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
 static __RAM_FUNC bool adaptive_smps_voltage_limited( control_loop_config_st const *pCfg );
 static __RAM_FUNC void adaptive_update( pid_st *pPid, float y, float u, bool blocked, float action );
 static __RAM_FUNC float PI_adaptive_calculate( pid_st *pPid, control_loop_config_st const *pCfg, float sp, float pv );
@@ -265,19 +266,31 @@ const controller_st Controller =
 static CCMRAM pid_st pid_inst[ MAX_CONTROL_LOOP ];
 
 /*
- * CTRL_PI_GS multiplier tables. All 1.0 until the plant is measured at each SV,
- * so this type behaves like CTRL_PID for now.
+ * CTRL_PI_GS multiplier tables. Provisional values, not measured: Kp is raised for
+ * a move away from room temperature and lowered for a move toward it.
+ * Ti stays 1.0 until the plant time constant is measured at each SV.
  */
 static const float gs_sv_points[ GS_POINT_COUNT ] = { 10.0f, 30.0f, 50.0f, 70.0f };
 static const float gs_kp_mult[ GS_DIRECTION_COUNT ][ GS_POINT_COUNT ] =
 {
-	[ GS_TEMP_RISING ]  = { 1.0f, 1.0f, 1.0f, 1.0f },
-	[ GS_TEMP_FALLING ] = { 1.0f, 1.0f, 1.0f, 1.0f },
+	[ GS_TEMP_RISING ]  = { 0.8f, 1.0f, 1.0f, 1.2f },
+	[ GS_TEMP_FALLING ] = { 1.2f, 1.0f, 1.0f, 0.8f },
 };
 static const float gs_ti_mult[ GS_DIRECTION_COUNT ][ GS_POINT_COUNT ] =
 {
 	[ GS_TEMP_RISING ]  = { 1.0f, 1.0f, 1.0f, 1.0f },
 	[ GS_TEMP_FALLING ] = { 1.0f, 1.0f, 1.0f, 1.0f },
+};
+
+/*
+ * CTRL_PI_GS_ERR multiplier table by |SV - PV| (degC). Provisional values, not measured:
+ * gain is lowered near the target. Both directions start with the same values.
+ */
+static const float gs_err_points[ GS_POINT_COUNT ] = { 0.0f, 1.0f, 3.0f, 5.0f };
+static const float gs_err_mult[ GS_DIRECTION_COUNT ][ GS_POINT_COUNT ] =
+{
+	[ GS_TEMP_RISING ]  = { 0.5f, 0.5f, 0.75f, 1.0f },
+	[ GS_TEMP_FALLING ] = { 0.5f, 0.5f, 0.75f, 1.0f },
 };
 
 static int loop_idx = 0;
@@ -385,6 +398,7 @@ void ControllerTask( void )
 					case CTRL_PI_SV_RATE:
 					case CTRL_PI_GS:
 					case CTRL_PI_ADAPTIVE:
+					case CTRL_PI_GS_ERR:
 						pid_calculation( pCfg, pInst );
 						break;
 					case CTRL_ONOFF:
@@ -479,7 +493,7 @@ static void set_default_config( int32_t loop_idx )
 	pCfg->OutputMin = -1000;                // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	pCfg->PWMFreq = 10;                     // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	pCfg->OutputDelay = 0;                  // default: 0         / Range: 0 ~ 999 (sec)
-	pCfg->ControlType = CTRL_PID;           // default: PID       / Range: 0 ~ 8 ( control_et )
+	pCfg->ControlType = CTRL_PID;           // default: PID       / Range: 0 ~ 9 ( control_et )
 	pCfg->CoolHeat = COOL_CTRL_MODE;        // default: COOL      / Range: COOL, HEAT
 	pCfg->StartDelay = 10;                  // default: 10        / Range: 0 ~ 999 (sec)
 	pCfg->SmpsLeakageCurrent = 100;         // default: 100       / Range: 0 ~ 60000 (mA)
@@ -744,25 +758,28 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 
 			switch( pCfg->ControlType )
 			{
-				case CTRL_PID:
+				case CTRL_PID:				// 0: 일반 PID (포화 시 역계산으로 I항 보정)
 					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
 					break;
-				case CTRL_PID_PROD:
+				case CTRL_PID_PROD:			// 2: 양산 PID (GitLab chpc-tcm1 main의 계산식)
 					pInst->MV = PID_production_calculate( pPid, pCfg, pInst, dt, sp, pv );
 					break;
-				case CTRL_PI_COND_I:
+				case CTRL_PI_COND_I:		// 3: 조건부 적분 PI (포화를 키우는 방향이면 적분 정지)
 					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
 					break;
-				case CTRL_PI_SV_RATE:
+				case CTRL_PI_SV_RATE:		// 4: SV 변화율 제한 PI (내부 SV를 일정 속도로 이동)
 					pInst->MV = PI_sv_rate_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_GS:
+				case CTRL_PI_GS:			// 5: 게인 스케줄링 PI (SV와 승온/냉각 방향별 게인 배율)
 					pInst->MV = PI_gain_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_ADAPTIVE:
+				case CTRL_PI_ADAPTIVE:		// 6: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
 					pInst->MV = PI_adaptive_calculate( pPid, pCfg, sp, pv );
 					break;
-				case CTRL_2DOF_PID:
+				case CTRL_PI_GS_ERR:		// 7: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
+					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_2DOF_PID:			// 1: 2자유도 PID (SV 필터 적용)
 				default:
 					pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat );
 					break;
@@ -1084,21 +1101,22 @@ static __RAM_FUNC float PI_sv_rate_calculate( pid_st *pPid, float sp, float pv, 
 }
 
 /******************************************************************************
- * @brief Linear interpolation over GS_POINT_COUNT points of gs_sv_points.
+ * @brief Linear interpolation over GS_POINT_COUNT points.
  *
- * @param table Value at each point of gs_sv_points
- * @param sv Setpoint Value (SP)
+ * @param points Input value of each point, in increasing order
+ * @param table Value at each point
+ * @param x Input value
  * @return Interpolated value. Clamped to the first and last points.
  ******************************************************************************/
-static __RAM_FUNC float gs_interpolate( float const table[ GS_POINT_COUNT ], float sv )
+static __RAM_FUNC float gs_interpolate( float const points[ GS_POINT_COUNT ], float const table[ GS_POINT_COUNT ], float x )
 {
-	if( sv <= gs_sv_points[ 0 ] ) return table[ 0 ];
+	if( x <= points[ 0 ] ) return table[ 0 ];
 
 	for( int idx = 1; idx < GS_POINT_COUNT; ++idx )
 	{
-		if( sv <= gs_sv_points[ idx ] )
+		if( x <= points[ idx ] )
 		{
-			float ratio = ( sv - gs_sv_points[ idx - 1 ] ) / ( gs_sv_points[ idx ] - gs_sv_points[ idx - 1 ] );
+			float ratio = ( x - points[ idx - 1 ] ) / ( points[ idx ] - points[ idx - 1 ] );
 
 			return table[ idx - 1 ] + ratio * ( table[ idx ] - table[ idx - 1 ] );
 		}
@@ -1124,13 +1142,33 @@ static __RAM_FUNC float PI_gain_scheduled_calculate( pid_st *pPid, float sp, flo
 	{
 		int direction = ( sp > pv ) ? GS_TEMP_RISING : GS_TEMP_FALLING;
 
-		pPid->GsKpMult = gs_interpolate( gs_kp_mult[ direction ], sp );
-		pPid->GsTiMult = gs_interpolate( gs_ti_mult[ direction ], sp );
+		pPid->GsKpMult = gs_interpolate( gs_sv_points, gs_kp_mult[ direction ], sp );
+		pPid->GsTiMult = gs_interpolate( gs_sv_points, gs_ti_mult[ direction ], sp );
 		pPid->GsSp = sp;
 		pPid->GsValid = true;
 	}
 
 	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * pPid->GsKpMult, pPid->Ti * pPid->GsTiMult, AW_BACK_CALCULATION );
+}
+
+/******************************************************************************
+ * @brief PI with gains scheduled by SV - PV. The multiplier is recalculated every
+ * cycle. Kp and Ti get the same multiplier, so Kp / Ti (integral speed) stays the
+ * same and only the P term changes with the error.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_error_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	const float diff = sp - pv;
+	const int direction = ( diff > 0.0f ) ? GS_TEMP_RISING : GS_TEMP_FALLING;
+	const float mult = gs_interpolate( gs_err_points, gs_err_mult[ direction ], fabsf( diff ) );
+
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * mult, pPid->Ti * mult, AW_BACK_CALCULATION );
 }
 
 /******************************************************************************

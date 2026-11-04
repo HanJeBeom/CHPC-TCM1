@@ -39,6 +39,8 @@
 /*****************************************************************************/
 void ModbusMasterTask( void );
 uint32_t ModbusMasterGetReadSequence( uint8_t smps_id );
+uint32_t ModbusMasterGetWriteSequence( uint8_t smps_id );
+uint32_t ModbusMasterGetTimeoutCount( uint8_t smps_id );
 uint32_t ModbusMasterGetDataAgeMs( uint8_t smps_id );
 
 #endif /* INC_A_MBMASTER_H_ */

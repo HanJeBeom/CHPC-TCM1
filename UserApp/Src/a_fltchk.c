@@ -384,8 +384,8 @@ static bool fault_check_control_time_over( int loop_idx, int32_t PV, const contr
 static bool find_config_error( const control_loop_config_st *const pCfg )
 {
 	if( ( pCfg->OutputMax < pCfg->OutputMin )
-		|| ( pCfg->ControlType > CTRL_BYPASS )
-		|| ( pCfg->ControlType <= CTRL_PID && !pCfg->Pb && !pCfg->Ti && !pCfg->Td )
+		|| ( !CONTROL_TYPE_IS_VALID( pCfg->ControlType ) )
+		|| ( CONTROL_TYPE_USES_PLC_GAIN( pCfg->ControlType ) && !pCfg->Pb && !pCfg->Ti && !pCfg->Td )
 		|| ( pCfg->ControlPeriod < MIN_CONTROL_PERIOD )
 	)
 	{

@@ -39,6 +39,37 @@
 
 #define ERROR_VALUE_I_TERM_WINDING 40.0f
 
+/* CTRL_PI_SV_RATE. Provisional value: replace after measuring the plant rise rate. */
+#define SV_RATE_DEGC_PER_SEC 0.5f
+
+/* CTRL_PI_GS. Number of SV points in gs_sv_points and the multiplier tables. */
+#define GS_POINT_COUNT 4
+
+/* CTRL_PI_ADAPTIVE. Provisional values: replace after measuring the plant. */
+#define ADAPT_WINDOW_SEC 5.0f           // One model update period. MV is averaged over the whole window
+#define ADAPT_END_SAMPLES 10            // PV is averaged over the last samples of the window
+#define ADAPT_HISTORY_WINDOWS 2         // Previous windows needed for one model update
+#define ADAPT_BLOCK_WINDOWS 3           // A blocked window is part of this many model updates
+#define ADAPT_FORGETTING 0.995f         // Recursive least squares forgetting factor
+#define ADAPT_INIT_POLE 0.9f
+#define ADAPT_INIT_COVARIANCE 100.0f
+#define ADAPT_MAX_COVARIANCE 1.0e6f
+#define ADAPT_MIN_DPV_DEGC 0.02f        // Below this and ADAPT_MIN_DMV, the window has no information
+#define ADAPT_MIN_DMV 0.005f
+#define ADAPT_MIN_POLE 0.5f
+#define ADAPT_MAX_POLE 0.995f
+#define ADAPT_MIN_PLANT_GAIN 1.0f       // degC / per-unit MV
+#define ADAPT_LAMBDA_SEC 10.0f          // Target closed-loop time constant
+#define ADAPT_DELAY_SEC 0.2f            // Command delay used for tuning
+#define ADAPT_GAIN_SMOOTHING 0.1f       // Gain movement per window
+#define ADAPT_INIT_KP 0.05f             // 5 %/degC
+#define ADAPT_INIT_TI_SEC 12.0f
+#define ADAPT_KP_MIN 0.01f              // 1 %/degC
+#define ADAPT_KP_MAX 0.10f              // 10 %/degC. Low for the first tests, raise after checking the logs
+#define ADAPT_TI_MIN_SEC 5.0f
+#define ADAPT_TI_MAX_SEC 300.0f
+#define ADAPT_VOUT_FREEZE_V 240.0f      // Below the 245 V and 275 V limits of the CHPP-8022 modes
+
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
 /*****************************************************************************/
@@ -60,6 +91,13 @@ typedef struct control_loop_instance_Tag
 	float lastFilteredSV;
 	float oldFilteredSV;
 	float filter_alpha;
+	/* Log counters. They stay across disable so one log can cover several starts. */
+	uint32_t ControlCalcSeq;
+	uint32_t MvOverrideCount;
+	uint32_t MvSignChangeCount;
+	uint32_t EnableSeq;
+	int8_t LastMvSign;
+	bool MvOverridden;
 	struct
 	{
 		float Ku;
@@ -89,6 +127,51 @@ typedef struct controller_variable_struct_Tag
 	bool Inited;
 } controller_var_st;
 
+typedef enum
+{
+	AW_BACK_CALCULATION,
+	AW_CONDITIONAL_INTEGRATION,
+} anti_windup_et;
+
+typedef enum
+{
+	GS_TEMP_RISING,
+	GS_TEMP_FALLING,
+	GS_DIRECTION_COUNT,
+} gs_direction_et;
+
+typedef enum
+{
+	ADAPT_STATE_WARMUP,         // Not enough windows yet
+	ADAPT_STATE_BLOCKED,        // Saturation, SMPS voltage limit or MV sign change
+	ADAPT_STATE_NO_EXCITATION,  // PV and MV are not moving
+	ADAPT_STATE_REJECTED,       // Estimate is outside the expected plant
+	ADAPT_STATE_RESET,          // Estimator was reset
+	ADAPT_STATE_UPDATED,        // Gains moved toward the new estimate
+} adaptive_state_et;
+
+typedef struct
+{
+	// Gains in use
+	float Kp, Ti;
+
+	// One window
+	float SumY, SumU;
+	uint16_t Samples, EndSamples;
+	bool WindowBlocked;
+
+	// Previous windows
+	float Y1, Y2, U1;
+	uint8_t Count, BlockedWindows;
+
+	// Recursive least squares: dy[k] = A * dy[k-1] + B * du[k]
+	float A, B, P00, P01, P11;
+
+	// Result
+	float EstGain, EstTau;
+	uint16_t State;
+} adaptive_st;
+
 typedef struct {
 	float Kp, Ti, Td, alpha, lambda, Ts;
 	float u_min, u_max;
@@ -106,6 +189,20 @@ typedef struct {
 
 	// Anti-windup gain
 	float Kaw;
+
+	// First calculation after enable has not run yet
+	bool Started;
+
+	// CTRL_PI_GS
+	bool GsValid;
+	float GsSp, GsKpMult, GsTiMult;
+
+	// CTRL_PI_ADAPTIVE
+	adaptive_st Ad;
+
+	// Values of the last calculation, for logging
+	float AppliedKp, AppliedTi;
+	float SvRef, PTerm, ITerm, DTerm, MvCalc;
 } pid_st;
 
 
@@ -130,6 +227,17 @@ static void autotune_relay_method( control_loop_config_st *pCfg, control_loop_in
 static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *pCfg );
 static __RAM_FUNC void PID_instance_UpdateGains( pid_st *pPid, control_loop_config_st const *pCfg );
 static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat, float Kp, float Ti, anti_windup_et aw );
+static __RAM_FUNC void PID_instance_Start( pid_st *pPid, float pv );
+static __RAM_FUNC float PID_production_calculate( pid_st *pPid, control_loop_config_st const *pCfg, control_loop_instance_st *pInst, float dt, float sp, float pv );
+static __RAM_FUNC float PI_sv_rate_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC float gs_interpolate( float const table[ GS_POINT_COUNT ], float sv );
+static __RAM_FUNC float PI_gain_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC bool adaptive_smps_voltage_limited( control_loop_config_st const *pCfg );
+static __RAM_FUNC void adaptive_update( pid_st *pPid, float y, float u, bool blocked, float action );
+static __RAM_FUNC float PI_adaptive_calculate( pid_st *pPid, control_loop_config_st const *pCfg, float sp, float pv );
+static __RAM_FUNC void adaptive_reset_estimator( adaptive_st *ad );
+static void control_loop_get_diag( int loop_idx, controller_diag_st *diag );
 static __RAM_FUNC float pid_calculation_ai_tustin( pid_st* pPid, float sp, float pv );
 static __RAM_FUNC float pid_calculation_too_simple( control_loop_config_st *pCfg, control_loop_instance_st *pInst );
 
@@ -147,6 +255,7 @@ const controller_st Controller =
     .GetConfig = control_loop_get_config,
     .ClearAlarm = control_loop_clear_alarm,
     .SetDefault = set_default_config,
+    .GetDiag = control_loop_get_diag,
 };
 
 /*****************************************************************************/
@@ -154,6 +263,22 @@ const controller_st Controller =
 /*****************************************************************************/
 
 static CCMRAM pid_st pid_inst[ MAX_CONTROL_LOOP ];
+
+/*
+ * CTRL_PI_GS multiplier tables. All 1.0 until the plant is measured at each SV,
+ * so this type behaves like CTRL_PID for now.
+ */
+static const float gs_sv_points[ GS_POINT_COUNT ] = { 10.0f, 30.0f, 50.0f, 70.0f };
+static const float gs_kp_mult[ GS_DIRECTION_COUNT ][ GS_POINT_COUNT ] =
+{
+	[ GS_TEMP_RISING ]  = { 1.0f, 1.0f, 1.0f, 1.0f },
+	[ GS_TEMP_FALLING ] = { 1.0f, 1.0f, 1.0f, 1.0f },
+};
+static const float gs_ti_mult[ GS_DIRECTION_COUNT ][ GS_POINT_COUNT ] =
+{
+	[ GS_TEMP_RISING ]  = { 1.0f, 1.0f, 1.0f, 1.0f },
+	[ GS_TEMP_FALLING ] = { 1.0f, 1.0f, 1.0f, 1.0f },
+};
 
 static int loop_idx = 0;
 static CCMRAM controller_var_st ControllerVars = { 0 };
@@ -245,6 +370,9 @@ void ControllerTask( void )
 				pInst->MV = pCfg->OutputMin * MULTIPLY_PERMIL_TO_FLOAT;
 				pInst->IntegralSum = 0;
 				pInst->lastError = 0;
+				pInst->EnableSeq++;
+				pInst->MvOverrideCount++;
+				pInst->MvOverridden = true;
 			}
 			else if( AppTimer.IsExpired( &pInst->timerStartDelay ) )
 			{
@@ -252,6 +380,11 @@ void ControllerTask( void )
 				{
 					case CTRL_PID:
 					case CTRL_2DOF_PID:
+					case CTRL_PID_PROD:
+					case CTRL_PI_COND_I:
+					case CTRL_PI_SV_RATE:
+					case CTRL_PI_GS:
+					case CTRL_PI_ADAPTIVE:
 						pid_calculation( pCfg, pInst );
 						break;
 					case CTRL_ONOFF:
@@ -269,16 +402,34 @@ void ControllerTask( void )
 					pInst->lastSV = pCfg->SV;
 					AppTimer.Start( &pInst->timerOutputDelay, pCfg->OutputDelay );
 					pInst->MV = pCfg->OutputMin * MULTIPLY_PERMIL_TO_FLOAT;
+					pInst->MvOverrideCount++;
+					pInst->MvOverridden = true;
 				}
 				if( !AppTimer.IsExpired( &pInst->timerOutputDelay ) )
 				{
 					pInst->MV = pCfg->OutputMin * MULTIPLY_PERMIL_TO_FLOAT;
 					pInst->lastError = 0;
+					pInst->MvOverrideCount++;
+					pInst->MvOverridden = true;
 				}
+			}
+
+			/* MV 0 keeps the SMPS polarity, so only a nonzero sign counts. */
+			if( 0.0f != pInst->MV )
+			{
+				int8_t mv_sign = ( pInst->MV > 0.0f ) ? 1 : -1;
+
+				if( ( 0 != pInst->LastMvSign ) && ( mv_sign != pInst->LastMvSign ) )
+				{
+					pInst->MvSignChangeCount++;
+				}
+				pInst->LastMvSign = mv_sign;
 			}
 		}
 		else
 		{
+			pInst->LastMvSign = 0;
+			pInst->MvOverridden = false;
 			PID_instance_Init( &pid_inst[ loop_idx ], pCfg );
 			pInst->MV = 0;
 			pInst->IntegralSum = 0;
@@ -328,7 +479,7 @@ static void set_default_config( int32_t loop_idx )
 	pCfg->OutputMin = -1000;                // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	pCfg->PWMFreq = 10;                     // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	pCfg->OutputDelay = 0;                  // default: 0         / Range: 0 ~ 999 (sec)
-	pCfg->ControlType = CTRL_2DOF_PID;      // default: 2DOF PID  / Range: 2DOF PID, PID, ONOFF
+	pCfg->ControlType = CTRL_PID;           // default: PID       / Range: 0 ~ 8 ( control_et )
 	pCfg->CoolHeat = COOL_CTRL_MODE;        // default: COOL      / Range: COOL, HEAT
 	pCfg->StartDelay = 10;                  // default: 10        / Range: 0 ~ 999 (sec)
 	pCfg->SmpsLeakageCurrent = 100;         // default: 100       / Range: 0 ~ 60000 (mA)
@@ -578,11 +729,46 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 		}
 		else
 		{
-			/* Apply PB/Ti/Td written by the PLC without requiring CL Disable. */
-			PID_instance_UpdateGains( &pid_inst[ pInst->CH ], pCfg );
+			pid_st *pPid = &pid_inst[ pInst->CH ];
 			float sp = pCfg->SV * MULTIPLY_mK_TO_K;
 			float pv = pInst->PV * MULTIPLY_mK_TO_K;
-			pInst->MV = PID2DOF_Calculate_backward_euler( &pid_inst[ pInst->CH ], sp, pv, pCfg->CoolHeat );
+
+			/* CTRL_PI_ADAPTIVE decides its own gains, so PLC gains are not applied to it. */
+			if( CTRL_PI_ADAPTIVE != pCfg->ControlType )
+			{
+				/* Apply PB/Ti/Td written by the PLC without requiring CL Disable. */
+				PID_instance_UpdateGains( pPid, pCfg );
+			}
+
+			PID_instance_Start( pPid, pv );
+
+			switch( pCfg->ControlType )
+			{
+				case CTRL_PID:
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+					break;
+				case CTRL_PID_PROD:
+					pInst->MV = PID_production_calculate( pPid, pCfg, pInst, dt, sp, pv );
+					break;
+				case CTRL_PI_COND_I:
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
+					break;
+				case CTRL_PI_SV_RATE:
+					pInst->MV = PI_sv_rate_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_GS:
+					pInst->MV = PI_gain_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_ADAPTIVE:
+					pInst->MV = PI_adaptive_calculate( pPid, pCfg, sp, pv );
+					break;
+				case CTRL_2DOF_PID:
+				default:
+					pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+			}
+			pInst->ControlCalcSeq++;
+			pInst->MvOverridden = false;
 			retval = 1;
 		}
 	}
@@ -641,12 +827,37 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		SP_ref = sp; // Ti가 0이면 필터 없이 통과
 	}
 
-	// 2. 오차 계산 (필터링된 SV - 현재 PV)
+	float mv = PID_core( pPID, SP_ref, pv, cool_heat, pPID->Kp, Ti, AW_BACK_CALCULATION );
+
+	// 목표값 필터의 다음 스텝을 위해 현재 상태 저장
+	pPID->SP_ref_prev = SP_ref;
+	pPID->SP_prev = sp;
+
+	return mv;
+}
+
+/******************************************************************************
+ * @brief Common PI(D) calculation with setpoint weighting already applied.
+ *
+ * @param pPID Pointer to pid_st structure
+ * @param sp Setpoint used for the error (after any filter or rate limit)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @param Kp Proportional gain applied in this calculation
+ * @param Ti Integral time applied in this calculation (sec)
+ * @param aw Anti-windup method
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mode_et cool_heat, float Kp, float Ti, anti_windup_et aw )
+{
+	float Ts = pPID->Ts;
+
+	// 2. 오차 계산 (SV - 현재 PV)
 	float action = ( COOL_CTRL_MODE == cool_heat ) ? -1.0f : 1.0f;
-	float error = action * ( SP_ref - pv );
+	float error = action * ( sp - pv );
 
 	// 3. 비례항 (Proportional)
-	float P_term = pPID->Kp * error;
+	float P_term = Kp * error;
 
 	// 4. 선행 미분항 (Derivative on PV)
 	// e[k] - e[k-1]이 아닌 PV[k] - PV[k-1]을 이용함
@@ -662,14 +873,15 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		float denominator = Ts + ( lambda * Td );
 		if( ( denominator < 0.0f ) || ( 0.0f < denominator ) )
 		{
-			float num_d = ( lambda * Td * pPID->v_prev ) + ( pPID->Kp * Td * ( pv - pPID->PV_prev ) );
+			float num_d = ( lambda * Td * pPID->v_prev ) + ( Kp * Td * ( pv - pPID->PV_prev ) );
 			D_term = num_d / denominator;
 		}
 	}
 
 	// 5. 계산된 조작량 (Calculated MV) - 아직 제한 전
 	// 주의: 적분항은 '이전 스텝까지 누적된 값(I)'을 사용합니다.
-	float mv_calc = P_term + pPID->I - ( action * D_term );
+	const float I_before = pPID->I;
+	float mv_calc = P_term + I_before - ( action * D_term );
 
 	// 6. 출력 제한 (Saturation) 및 실제 조작량 결정
 	float mv_final = mv_calc;
@@ -689,25 +901,463 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 	float Ki_term = 0.0f;
 	if( Ti > 0.0f )
 	{
-		Ki_term = ( pPID->Kp / Ti ) * error * Ts;
+		Ki_term = ( Kp / Ti ) * error * Ts;
 	}
 
-	// Saturation 오차 (실제 출력 - 계산된 출력)
-	float saturation_diff = mv_final - mv_calc;
+	if( AW_CONDITIONAL_INTEGRATION == aw )
+	{
+		// 포화 방향으로 오차가 더 밀어 올리는 동안에는 적분을 멈춘다.
+		bool push_over_max = ( mv_calc > pPID->u_max ) && ( error > 0.0f );
+		bool push_under_min = ( mv_calc < pPID->u_min ) && ( error < 0.0f );
 
-	// 역계산 항 (Tracking Term)
-	float back_calc_term = pPID->Kaw * saturation_diff * Ts;
+		if( !push_over_max && !push_under_min )
+		{
+			pPID->I += Ki_term;
+		}
+	}
+	else
+	{
+		// Saturation 오차 (실제 출력 - 계산된 출력)
+		float saturation_diff = mv_final - mv_calc;
 
-	// 다음 주기를 위한 적분값 누적
-	pPID->I += Ki_term + back_calc_term;
+		// 역계산 항 (Tracking Term)
+		float Kaw = ( Ti > 0.0f ) ? ( 1.0f / Ti ) : 0.0f;
+		float back_calc_term = Kaw * saturation_diff * Ts;
 
-	// 8. 다음 스텝을 위해 현재 상태 저장
-	pPID->SP_ref_prev = SP_ref;
-	pPID->SP_prev = sp;
+		// 다음 주기를 위한 적분값 누적
+		pPID->I += Ki_term + back_calc_term;
+	}
+
+	// 8. 로그용 값 저장. 적분을 갱신하기 전 값으로 mv_calc = P + I + D가 되게 한다.
+	pPID->SvRef = sp;
+	pPID->PTerm = P_term;
+	pPID->ITerm = I_before;
+	pPID->DTerm = -( action * D_term );
+	pPID->MvCalc = mv_calc;
+	pPID->AppliedKp = Kp;
+	pPID->AppliedTi = Ti;
+
+	// 9. 다음 스텝을 위해 현재 상태 저장
 	pPID->PV_prev = pv;
 	pPID->v_prev = D_term;
 
 	return mv_final;
+}
+
+/******************************************************************************
+ * @brief Set controller history from the first PV after the loop is enabled.
+ *
+ * A setpoint filter that starts from 0 degC treats the first calculation as a
+ * step from 0 degC, so all history starts from the current PV instead.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param pv Process Value (PV)
+ ******************************************************************************/
+static __RAM_FUNC void PID_instance_Start( pid_st *pPid, float pv )
+{
+	if( pPid->Started ) return;
+
+	pPid->Started = true;
+	pPid->SP_prev = pv;
+	pPid->SP_ref_prev = pv;
+	pPid->PV_prev = pv;
+	pPid->v_prev = 0.0f;
+}
+
+/******************************************************************************
+ * @brief Production PID. Formula of pid_calculation() in GitLab chpc-tcm1 main,
+ * except that Kp uses the same PB unit as the other controllers.
+ *
+ * @param pPid Pointer to pid_st structure (diagnostics only)
+ * @param pCfg Pointer to control_loop_config_st structure
+ * @param pInst Pointer to control_loop_instance_st structure
+ * @param dt Control period (sec)
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PID_production_calculate( pid_st *pPid, control_loop_config_st const *pCfg, control_loop_instance_st *pInst, float dt, float sp, float pv )
+{
+	const float Kp = pCfg->Pb ? ( 100.0f / ( pCfg->Pb * MULTIPLY_Pb_INT_TO_FLOAT ) ) : 0.0f;
+	const float Ti = pCfg->Ti * MULTIPLY_Ti_INT_TO_FLOAT;
+	const float Td = pCfg->Td * MULTIPLY_Td_INT_TO_FLOAT;
+	const float fOutputMax = pCfg->OutputMax * MULTIPLY_PERMIL_TO_FLOAT;
+	const float fOutputMin = pCfg->OutputMin * MULTIPLY_PERMIL_TO_FLOAT;
+	float fMV;
+
+	float error = sp - pv;
+
+	if( COOL_CTRL_MODE == pCfg->CoolHeat )
+	{
+		error *= -1;
+	}
+
+	pInst->IntegralSum = ( Ti > 0.0f ) ? pInst->IntegralSum + Kp * ( error * dt / Ti ) : 0.0f;
+
+	if( pCfg->Saturated_I )
+	{
+		const float SaturatedI = pCfg->Saturated_I * MULTIPLY_SatI_INT_TO_FLOAT;
+
+		if( pInst->IntegralSum > SaturatedI )
+		{
+			pInst->IntegralSum = SaturatedI;
+		}
+		else if( pInst->IntegralSum < -SaturatedI )
+		{
+			pInst->IntegralSum = -SaturatedI;
+		}
+	}
+
+	float proportion = error;
+	float differential = ( error - pInst->lastError ) / dt * Td;
+
+	fMV = Kp * ( proportion + differential ) + pInst->IntegralSum;
+
+	pPid->SvRef = sp;
+	pPid->PTerm = Kp * proportion;
+	pPid->ITerm = pInst->IntegralSum;
+	pPid->DTerm = Kp * differential;
+	pPid->MvCalc = fMV;
+
+	if( isfinite( fMV ) )
+	{
+		// MV Limitation and Anti-Windup
+		if( fMV > fOutputMax )
+		{
+			pInst->IntegralSum = fOutputMax - Kp * ( proportion + differential );
+			fMV = fOutputMax;
+		}
+		else if( fMV < fOutputMin )
+		{
+			pInst->IntegralSum = fOutputMin - Kp * ( proportion + differential );
+			fMV = fOutputMin;
+		}
+	}
+	else
+	{
+		if( isnan( fMV ) )
+		{
+		}
+		else if( signbit( fMV ) > 0 )
+		{
+			fMV = fOutputMax;
+		}
+		else if( signbit( fMV ) < 0 )
+		{
+			fMV = fOutputMin;
+		}
+	}
+
+	pInst->lastError = error;
+	pPid->AppliedKp = Kp;
+	pPid->AppliedTi = Ti;
+
+	return fMV;
+}
+
+/******************************************************************************
+ * @brief PI with a setpoint that moves toward SV at a fixed rate.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_sv_rate_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	const float step = SV_RATE_DEGC_PER_SEC * pPid->Ts;
+	float sp_ref = pPid->SP_ref_prev;
+
+	if( sp > sp_ref )
+	{
+		sp_ref = fminf( sp_ref + step, sp );
+	}
+	else
+	{
+		sp_ref = fmaxf( sp_ref - step, sp );
+	}
+
+	pPid->SP_ref_prev = sp_ref;
+
+	return PID_core( pPid, sp_ref, pv, cool_heat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+}
+
+/******************************************************************************
+ * @brief Linear interpolation over GS_POINT_COUNT points of gs_sv_points.
+ *
+ * @param table Value at each point of gs_sv_points
+ * @param sv Setpoint Value (SP)
+ * @return Interpolated value. Clamped to the first and last points.
+ ******************************************************************************/
+static __RAM_FUNC float gs_interpolate( float const table[ GS_POINT_COUNT ], float sv )
+{
+	if( sv <= gs_sv_points[ 0 ] ) return table[ 0 ];
+
+	for( int idx = 1; idx < GS_POINT_COUNT; ++idx )
+	{
+		if( sv <= gs_sv_points[ idx ] )
+		{
+			float ratio = ( sv - gs_sv_points[ idx - 1 ] ) / ( gs_sv_points[ idx ] - gs_sv_points[ idx - 1 ] );
+
+			return table[ idx - 1 ] + ratio * ( table[ idx ] - table[ idx - 1 ] );
+		}
+	}
+
+	return table[ GS_POINT_COUNT - 1 ];
+}
+
+/******************************************************************************
+ * @brief Gain-scheduled PI. PLC gains are multiplied by a table selected by SV
+ * and by direction. The multipliers change only when SV changes, so the gains
+ * stay fixed during one response.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_gain_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	if( !pPid->GsValid || ( pPid->GsSp != sp ) )
+	{
+		int direction = ( sp > pv ) ? GS_TEMP_RISING : GS_TEMP_FALLING;
+
+		pPid->GsKpMult = gs_interpolate( gs_kp_mult[ direction ], sp );
+		pPid->GsTiMult = gs_interpolate( gs_ti_mult[ direction ], sp );
+		pPid->GsSp = sp;
+		pPid->GsValid = true;
+	}
+
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * pPid->GsKpMult, pPid->Ti * pPid->GsTiMult, AW_BACK_CALCULATION );
+}
+
+/******************************************************************************
+ * @brief Check whether the SMPS output voltage is close to its limit.
+ * Output no longer follows MV there, so the sample is not used for estimation.
+ *
+ * @param pCfg Pointer to control_loop_config_st structure
+ * @return true when the voltage is at or above ADAPT_VOUT_FREEZE_V
+ ******************************************************************************/
+static __RAM_FUNC bool adaptive_smps_voltage_limited( control_loop_config_st const *pCfg )
+{
+	int8_t smps_id = pCfg->OutputChannel;
+
+	if( ( OUT_SMPS_CHPP_8021 != pCfg->OutputType ) || ( smps_id < 0 ) || ( smps_id >= MAX_SMPS_ID ) ) return false;
+
+	int16_t vout_q5 = ( int16_t )MBM_READ_DB[ smps_id ].Holdings[ MBM_HR_CHPP_8021_OUTPUT_VOLTAGE_MEASURED ];
+
+	return fabsf( vout_q5 / 32.0f ) >= ADAPT_VOUT_FREEZE_V;
+}
+
+/******************************************************************************
+ * @brief Update the plant estimate with one window of PV and MV.
+ *
+ * Model (velocity form, offset free): dy[k] = a * dy[k-1] + b * du[k]
+ * y[k] is PV at the end of window k and u[k] is the MV average over window k,
+ * because that MV is what moves PV from y[k-1] to y[k].
+ * Plant gain K = b / (1 - a), time constant tau = T / (1 - a) - T / 2
+ * Gains (lambda tuning): Kp = tau / ( K * ( lambda + delay ) ), Ti = tau
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param y PV at the end of the window (degC)
+ * @param u Window average of MV (per-unit)
+ * @param blocked The window contains saturation or SMPS voltage limit
+ * @param action Control direction sign
+ ******************************************************************************/
+static __RAM_FUNC void adaptive_update( pid_st *pPid, float y, float u, bool blocked, float action )
+{
+	adaptive_st *ad = &pPid->Ad;
+
+	/* A sign change restarts the SMPS power stage, so it is treated like saturation. */
+	if( blocked || ( ( ad->Count > 0 ) && ( ( u * ad->U1 ) < 0.0f ) ) )
+	{
+		ad->BlockedWindows = ADAPT_BLOCK_WINDOWS;
+	}
+
+	float y2 = ad->Y2, y1 = ad->Y1, u1 = ad->U1;
+	bool history_ok = ( ad->Count >= ADAPT_HISTORY_WINDOWS );
+
+	ad->Y2 = y1;
+	ad->Y1 = y;
+	ad->U1 = u;
+	if( ad->Count < ADAPT_HISTORY_WINDOWS ) ad->Count++;
+
+	if( ad->BlockedWindows > 0 )
+	{
+		ad->BlockedWindows--;
+		ad->State = ADAPT_STATE_BLOCKED;
+		return;
+	}
+	if( !history_ok )
+	{
+		ad->State = ADAPT_STATE_WARMUP;
+		return;
+	}
+
+	const float dy = y - y1;
+	const float phi0 = y1 - y2;
+	const float phi1 = u - u1;
+
+	if( ( fabsf( phi0 ) < ADAPT_MIN_DPV_DEGC ) && ( fabsf( phi1 ) < ADAPT_MIN_DMV ) )
+	{
+		ad->State = ADAPT_STATE_NO_EXCITATION;
+		return;
+	}
+
+	/* Recursive least squares with forgetting factor */
+	const float Pphi0 = ad->P00 * phi0 + ad->P01 * phi1;
+	const float Pphi1 = ad->P01 * phi0 + ad->P11 * phi1;
+	const float denom = ADAPT_FORGETTING + phi0 * Pphi0 + phi1 * Pphi1;
+	const float k0 = Pphi0 / denom;
+	const float k1 = Pphi1 / denom;
+	const float pred_err = dy - ( ad->A * phi0 + ad->B * phi1 );
+	const float A_new = ad->A + k0 * pred_err;
+	const float B_new = ad->B + k1 * pred_err;
+	const float P00_new = ( ad->P00 - k0 * Pphi0 ) / ADAPT_FORGETTING;
+	const float P01_new = ( ad->P01 - k0 * Pphi1 ) / ADAPT_FORGETTING;
+	const float P11_new = ( ad->P11 - k1 * Pphi1 ) / ADAPT_FORGETTING;
+
+	if( !isfinite( A_new ) || !isfinite( B_new ) || !isfinite( P00_new ) || !isfinite( P01_new ) || !isfinite( P11_new )
+		|| ( P00_new <= 0.0f ) || ( P11_new <= 0.0f ) || ( ( P00_new + P11_new ) > ADAPT_MAX_COVARIANCE ) )
+	{
+		adaptive_reset_estimator( ad );
+		ad->State = ADAPT_STATE_RESET;
+		return;
+	}
+
+	ad->A = A_new;
+	ad->B = B_new;
+	ad->P00 = P00_new;
+	ad->P01 = P01_new;
+	ad->P11 = P11_new;
+
+	/* Keep the current gains when the estimate does not describe a stable plant of the expected sign. */
+	if( ( ad->A <= ADAPT_MIN_POLE ) || ( ad->A >= ADAPT_MAX_POLE ) )
+	{
+		ad->State = ADAPT_STATE_REJECTED;
+		return;
+	}
+
+	const float plant_gain = action * ad->B / ( 1.0f - ad->A );
+
+	if( plant_gain < ADAPT_MIN_PLANT_GAIN )
+	{
+		ad->State = ADAPT_STATE_REJECTED;
+		return;
+	}
+
+	const float tau = ADAPT_WINDOW_SEC / ( 1.0f - ad->A ) - ( 0.5f * ADAPT_WINDOW_SEC );
+	const float kp_target = fmaxf( ADAPT_KP_MIN, fminf( ADAPT_KP_MAX, tau / ( plant_gain * ( ADAPT_LAMBDA_SEC + ADAPT_DELAY_SEC ) ) ) );
+	const float ti_target = fmaxf( ADAPT_TI_MIN_SEC, fminf( ADAPT_TI_MAX_SEC, tau ) );
+
+	ad->Kp += ADAPT_GAIN_SMOOTHING * ( kp_target - ad->Kp );
+	ad->Ti += ADAPT_GAIN_SMOOTHING * ( ti_target - ad->Ti );
+	ad->EstGain = action * plant_gain;
+	ad->EstTau = tau;
+	ad->State = ADAPT_STATE_UPDATED;
+}
+
+/******************************************************************************
+ * @brief Adaptive PI. Firmware decides Kp and Ti from an online plant estimate.
+ * PB, Ti and Td from the PLC are not used.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param pCfg Pointer to control_loop_config_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_adaptive_calculate( pid_st *pPid, control_loop_config_st const *pCfg, float sp, float pv )
+{
+	adaptive_st *ad = &pPid->Ad;
+	const float action = ( COOL_CTRL_MODE == pCfg->CoolHeat ) ? -1.0f : 1.0f;
+
+	const uint16_t window_samples = ( uint16_t )fmaxf( 1.0f, ( ADAPT_WINDOW_SEC / pPid->Ts ) + 0.5f );
+
+	float mv = PID_core( pPid, sp, pv, pCfg->CoolHeat, ad->Kp, ad->Ti, AW_BACK_CALCULATION );
+
+	ad->SumU += mv;
+	ad->Samples++;
+
+	if( ( ad->Samples + ADAPT_END_SAMPLES ) > window_samples )
+	{
+		ad->SumY += pv;
+		ad->EndSamples++;
+	}
+
+	if( ( mv >= pPid->u_max ) || ( mv <= pPid->u_min ) || adaptive_smps_voltage_limited( pCfg ) )
+	{
+		ad->WindowBlocked = true;
+	}
+
+	if( ad->Samples >= window_samples )
+	{
+		adaptive_update( pPid, ad->SumY / ad->EndSamples, ad->SumU / ad->Samples, ad->WindowBlocked, action );
+
+		ad->SumY = 0.0f;
+		ad->SumU = 0.0f;
+		ad->Samples = 0;
+		ad->EndSamples = 0;
+		ad->WindowBlocked = false;
+	}
+
+	return mv;
+}
+
+/******************************************************************************
+ * @brief Reset the plant estimate. Gains stay as they are.
+ *
+ * @param ad Pointer to adaptive_st structure
+ ******************************************************************************/
+static __RAM_FUNC void adaptive_reset_estimator( adaptive_st *ad )
+{
+	ad->A = ADAPT_INIT_POLE;
+	ad->B = 0.0f;
+	ad->P00 = ADAPT_INIT_COVARIANCE;
+	ad->P01 = 0.0f;
+	ad->P11 = ADAPT_INIT_COVARIANCE;
+}
+
+/******************************************************************************
+ * @brief Report the values used by the running controller.
+ *
+ * @param loop_idx Index of control loop
+ * @param diag Output values
+ ******************************************************************************/
+static void control_loop_get_diag( int loop_idx, controller_diag_st *diag )
+{
+	if( !diag || ( 0 > loop_idx ) || ( loop_idx >= MAX_CONTROL_LOOP ) ) return;
+
+	pid_st const *pPid = &pid_inst[ loop_idx ];
+	control_loop_config_st const *pCfg = &ControllerVars.Cfg[ loop_idx ];
+	control_loop_instance_st const *pInst = &ControllerVars.Inst[ loop_idx ];
+	uint16_t limit_flags = 0;
+
+	if( pCfg->Enable && CFG.system.Run )
+	{
+		if( pInst->MV >= ( pCfg->OutputMax * MULTIPLY_PERMIL_TO_FLOAT ) ) limit_flags |= CTRL_LIMIT_MV_AT_MAX;
+		if( pInst->MV <= ( pCfg->OutputMin * MULTIPLY_PERMIL_TO_FLOAT ) ) limit_flags |= CTRL_LIMIT_MV_AT_MIN;
+	}
+	if( adaptive_smps_voltage_limited( pCfg ) ) limit_flags |= CTRL_LIMIT_SMPS_VOLTAGE;
+	if( pInst->MvOverridden ) limit_flags |= CTRL_LIMIT_MV_OVERRIDDEN;
+
+	diag->AppliedKp = pPid->AppliedKp;
+	diag->AppliedTi = pPid->AppliedTi;
+	diag->EstGain = pPid->Ad.EstGain;
+	diag->EstTau = pPid->Ad.EstTau;
+	diag->EstState = pPid->Ad.State;
+	diag->SvRef = pPid->SvRef;
+	diag->PTerm = pPid->PTerm;
+	diag->ITerm = pPid->ITerm;
+	diag->DTerm = pPid->DTerm;
+	diag->MvCalc = pPid->MvCalc;
+	diag->LimitFlags = limit_flags;
+	diag->ControlCalcSeq = pInst->ControlCalcSeq;
+	diag->MvOverrideCount = pInst->MvOverrideCount;
+	diag->MvSignChangeCount = pInst->MvSignChangeCount;
+	diag->EnableSeq = pInst->EnableSeq;
 }
 
 /******************************************************************************
@@ -795,6 +1445,25 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->b  = (2.0f * pPid->lambda * pPid->Td) / pPid->Ts;
 	pPid->v_prev = 0.0f;
 	pPid->PV_prev = 0.0f;
+
+	pPid->Started = false;
+	pPid->GsValid = false;
+	pPid->GsSp = 0.0f;
+	pPid->GsKpMult = 1.0f;
+	pPid->GsTiMult = 1.0f;
+	pPid->AppliedKp = 0.0f;
+	pPid->AppliedTi = 0.0f;
+	pPid->SvRef = 0.0f;
+	pPid->PTerm = 0.0f;
+	pPid->ITerm = 0.0f;
+	pPid->DTerm = 0.0f;
+	pPid->MvCalc = 0.0f;
+
+	memset( &pPid->Ad, 0, sizeof( pPid->Ad ) );
+	adaptive_reset_estimator( &pPid->Ad );
+	pPid->Ad.Kp = ADAPT_INIT_KP;
+	pPid->Ad.Ti = ADAPT_INIT_TI_SEC;
+	pPid->Ad.State = ADAPT_STATE_WARMUP;
 }
 
 /******************************************************************************

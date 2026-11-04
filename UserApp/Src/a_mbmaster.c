@@ -63,6 +63,8 @@ static uint8_t query_frame[ 256 ];
 static uint32_t smps_read_sequence[ MAX_SMPS_ID ];
 static uint32_t smps_last_read_tick_ms[ MAX_SMPS_ID ];
 static uint8_t smps_has_read[ MAX_SMPS_ID ];
+static uint32_t smps_write_sequence[ MAX_SMPS_ID ];
+static uint32_t smps_timeout_count[ MAX_SMPS_ID ];
 
 /*****************************************************************************/
 /** GLOBAL VARIABLES *********************************************************/
@@ -238,6 +240,11 @@ static mbm_status_et modbus_master( smps_cmd_st* SmpsCmd )
 					smps_last_read_tick_ms[ SmpsCmd->smps_id ] = HAL_GetTick();
 					smps_has_read[ SmpsCmd->smps_id ] = 1;
 				}
+				if( ( Modbus_FunCode_Preset_Multiple_Reg == modbus_rx.function_code )
+					&& ( SmpsCmd->smps_id < MAX_SMPS_ID ) )
+				{
+					smps_write_sequence[ SmpsCmd->smps_id ]++;
+				}
 			}
 
 			AppTimer.Start( &timerTxWait, TX_WAIT_DELAY );
@@ -279,6 +286,24 @@ uint32_t ModbusMasterGetReadSequence( uint8_t smps_id )
 }
 
 /******************************************************************************
+ * @brief Return the number of valid write responses.
+ *****************************************************************************/
+uint32_t ModbusMasterGetWriteSequence( uint8_t smps_id )
+{
+	if( smps_id >= MAX_SMPS_ID ) return 0;
+	return smps_write_sequence[ smps_id ];
+}
+
+/******************************************************************************
+ * @brief Return the number of transactions that ended without a response.
+ *****************************************************************************/
+uint32_t ModbusMasterGetTimeoutCount( uint8_t smps_id )
+{
+	if( smps_id >= MAX_SMPS_ID ) return 0;
+	return smps_timeout_count[ smps_id ];
+}
+
+/******************************************************************************
  * @brief Return milliseconds since the last valid SMPS read response.
  *****************************************************************************/
 uint32_t ModbusMasterGetDataAgeMs( uint8_t smps_id )
@@ -308,6 +333,10 @@ void ModbusMasterTask( void )
 			TICK_UP( cmd_idx, MAX_SMPS_CMD );
 			break;
 		case MBM_TIMEOUT:
+			if( SMPSCMD[ cmd_idx ].smps_id < MAX_SMPS_ID )
+			{
+				smps_timeout_count[ SMPSCMD[ cmd_idx ].smps_id ]++;
+			}
 			SMPSCMD[ cmd_idx ].smps_func = SMPS_CMD_NONE;
 			break;
 		case MBM_NOT_COMPLETED:

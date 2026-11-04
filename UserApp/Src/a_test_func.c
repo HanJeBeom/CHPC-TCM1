@@ -27,8 +27,8 @@
 #define TF_TASK_CYCLE_TIME		0.01f	// 10ms line scan
 #define TF_MEAS_PERIOD			0.5f	// continuous measurement stream period
 #define TF_LOG_PERIOD			0.1f	// CL1/CHPP-8021 CSV snapshot period
-#define TF_LOG_COLUMNS			44
-#define TF_LOG_LINE_MAX		640
+#define TF_LOG_COLUMNS			68
+#define TF_LOG_LINE_MAX		1024
 #define TF_CAL_HB_PERIOD		0.5f	// calibration heartbeat event period
 #define TF_GET_SETTLE_TIME		0.5f	// wait for a fresh ADC value after sensor type change
 #define TF_GET_TIMEOUT			3.0f	// FW single GET measurement timeout
@@ -167,8 +167,14 @@ static const char tf_log_csv_header[] =
 	"smps_read_seq_u32,smps_data_age_ms,smps_power_cmd_w,smps_status_u16,"
 	"smps_warning_u16,smps_fault_u16,smps_leak_ch1_q7,smps_leak_ch2_q7,"
 	"smps_leak_ch3_q7,smps_leak_ch4_q7,smps_current_ch1_q7,smps_current_ch2_q7,"
-	"smps_current_ch3_q7,smps_current_ch4_q7,smps_voltage_q5,smps_power_measured_w\r\n";
+	"smps_current_ch3_q7,smps_current_ch4_q7,smps_voltage_q5,smps_power_measured_w,"
+	"applied_kp_x10000,applied_ti_100ms,est_gain_x100,est_tau_100ms,est_state_u16,"
+	"sv_ref_mdegc,p_term_permille,i_term_permille,d_term_permille,mv_calc_permille,limit_flags_u16,"
+	"control_calc_seq,mv_override_count,mv_sign_change_count,enable_seq,pv_sample_gen,"
+	"smps_write_seq,smps_comm_timeout_count,scan_time_us,scan_time_max_us,"
+	"input_filter_coeff_raw,saturated_i_raw,autotune_enabled,temp_offset_raw\r\n";
 static CCMRAM char tf_log_line[ TF_LOG_LINE_MAX ];
+static float tf_log_scan_time_max = 0.0f;	// Longest main loop since the last log line (sec)
 
 /*****************************************************************************/
 /** FUNCTION DEFINITIONS *****************************************************/
@@ -1143,9 +1149,12 @@ static void tf_cmd_log( const char * s )
 			OutputRequestSmpsRead( OUT_SMPS_CHPP_8021, tf.log.smps_id );
 		}
 
-		test_func_emit( "<LOG START OK PERIOD_MS=100 COLUMNS=%d CL=1 SMPS_ID=%u SOURCE=%s\r\n",
+		test_func_emit( "<LOG START OK PERIOD_MS=100 COLUMNS=%d CL=1 SMPS_ID=%u SOURCE=%s BUILD=%06lX CFG_REV=%04X CONTROL_TYPE=%u\r\n",
 			TF_LOG_COLUMNS, ( unsigned int )tf.log.smps_id,
-			tf.log.manual ? "MANUAL" : "CL_CONFIG" );
+			tf.log.manual ? "MANUAL" : "CL_CONFIG",
+			( unsigned long )CFG_BUILD_DATE,
+			( unsigned int )CFG_REVISION,
+			( unsigned int )Controller.GetConfig( 0 )->ControlType );
 		if( CDC.Write( ( const uint8_t * )tf_log_csv_header,
 			( uint32_t )strlen( tf_log_csv_header ) ) != strlen( tf_log_csv_header ) )
 		{
@@ -1176,7 +1185,7 @@ static void tf_cmd_log( const char * s )
 }
 
 /******************************************************************************
- * @brief Capture and enqueue one 44-column CSV snapshot.
+ * @brief Capture and enqueue one CSV snapshot of TF_LOG_COLUMNS columns.
  *****************************************************************************/
 static void tf_log_stream_task( void )
 {
@@ -1212,13 +1221,25 @@ static void tf_log_stream_task( void )
 	int32_t rtd_ch1_mdegc = ( int32_t )( Temp.GetTemp( 0 ) * 1000.0f );
 	int32_t rtd_ch2_mdegc = ( int32_t )( Temp.GetTemp( 1 ) * 1000.0f );
 	uint32_t seq = ++tf.log.sample_seq;
+	controller_diag_st diag = { 0 };
+	int8_t pv_channel = pCfg->InputChannel;
+	uint32_t pv_sample_gen = ( ( 0 <= pv_channel ) && ( pv_channel < MAX_TEMP_CHANNEL ) ) ? Temp.GetSampleGeneration( ( uint8_t )pv_channel ) : 0U;
+	float scan_time_max = tf_log_scan_time_max;
+
+	tf_log_scan_time_max = 0.0f;
+	Controller.GetDiag( 0, &diag );
 
 	int n = snprintf( tf_log_line, sizeof( tf_log_line ),
 		"%lu,%lu,%lu,%u,%u,%u,%u,%d,%u,%d,"
 		"%u,%u,%u,%u,%d,%d,%u,%u,%u,%u,"
 		"%ld,%ld,%u,%ld,%ld,%ld,%ld,%u,"
 		"%lu,%lu,%d,%u,%u,%u,"
-		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u\r\n",
+		"%u,%u,%u,%u,%d,%d,%d,%d,%d,%u,"
+		"%ld,%ld,%ld,%ld,%u,"
+		"%ld,%ld,%ld,%ld,%ld,%u,"
+		"%lu,%lu,%lu,%lu,%lu,"
+		"%lu,%lu,%lu,%lu,"
+		"%d,%u,%u,%d\r\n",
 		( unsigned long )HAL_GetTick(),
 		( unsigned long )seq,
 		( unsigned long )tf.log.usb_dropped_count,
@@ -1262,7 +1283,31 @@ static void tf_log_stream_task( void )
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH3_OUTPUT_CURRENT ],
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_CH4_OUTPUT_CURRENT ],
 		( int )( int16_t )rd[ MBM_HR_CHPP_8021_OUTPUT_VOLTAGE_MEASURED ],
-		( unsigned int )rd[ MBM_HR_CHPP_8021_OUTPUT_POWER_MEASURED ] );
+		( unsigned int )rd[ MBM_HR_CHPP_8021_OUTPUT_POWER_MEASURED ],
+		( long )( diag.AppliedKp * 10000.0f ),
+		( long )( diag.AppliedTi * 10.0f ),
+		( long )( diag.EstGain * 100.0f ),
+		( long )( diag.EstTau * 10.0f ),
+		( unsigned int )diag.EstState,
+		( long )( diag.SvRef * 1000.0f ),
+		( long )( diag.PTerm * 1000.0f ),
+		( long )( diag.ITerm * 1000.0f ),
+		( long )( diag.DTerm * 1000.0f ),
+		( long )( diag.MvCalc * 1000.0f ),
+		( unsigned int )diag.LimitFlags,
+		( unsigned long )diag.ControlCalcSeq,
+		( unsigned long )diag.MvOverrideCount,
+		( unsigned long )diag.MvSignChangeCount,
+		( unsigned long )diag.EnableSeq,
+		( unsigned long )pv_sample_gen,
+		( unsigned long )ModbusMasterGetWriteSequence( smps_id ),
+		( unsigned long )ModbusMasterGetTimeoutCount( smps_id ),
+		( unsigned long )( AppTimer.Scan_Time.Now * 1000000.0f ),
+		( unsigned long )( scan_time_max * 1000000.0f ),
+		( int )pCfg->InputFilterCoeff,
+		( unsigned int )pCfg->Saturated_I,
+		( unsigned int )pCfg->AutoTuneEnabled,
+		( int )pCfg->TempOffset );
 
 	if( ( n <= 0 ) || ( n >= ( int )sizeof( tf_log_line ) )
 		|| ( CDC.Write( ( const uint8_t * )tf_log_line, ( uint32_t )n ) != ( uint32_t )n ) )
@@ -2226,6 +2271,12 @@ void TestFuncInit( void )
  *****************************************************************************/
 void TestFuncTask( void )
 {
+	/* Runs every main loop. The log line reads and clears this. */
+	if( AppTimer.Scan_Time.Now > tf_log_scan_time_max )
+	{
+		tf_log_scan_time_max = AppTimer.Scan_Time.Now;
+	}
+
 	if( !CDC.IsConnected() )
 	{
 		CDC.Purge();

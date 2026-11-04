@@ -273,7 +273,7 @@ static bool plc_holding_word_value_is_valid( uint16_t addr, uint16_t value )
 			case MBS_HR_CH1_OUTPUT_DELAY - MBS_HR_CH1_SV_L:
 				return value <= 999U;
 			case MBS_HR_CH1_CONTROL_TYPE - MBS_HR_CH1_SV_L:
-				return value <= CTRL_BYPASS;
+				return CONTROL_TYPE_IS_VALID( value );
 			case MBS_HR_CH1_START_DELAY - MBS_HR_CH1_SV_L:
 				return value <= 999U;
 			case MBS_HR_CH1_SMPS_LEAKAGE_CURRENT - MBS_HR_CH1_SV_L:

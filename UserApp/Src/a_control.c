@@ -70,6 +70,26 @@
 #define ADAPT_TI_MAX_SEC 300.0f
 #define ADAPT_VOUT_FREEZE_V 240.0f      // Below the 245 V and 275 V limits of the CHPP-8022 modes
 
+/* CTRL_PI_SPLIT. Provisional values: replace after measuring the plant. */
+#define SPLIT_COOL_GAIN 2.0f            // Gain multiplier on the cooling side
+#define SPLIT_ZERO_MV 0.02f             // Half width of the blend between the cooling and heating gains
+#define SPLIT_ZERO_ERR 0.2f             // Integral holds when |MV| and |error| are both inside their bands
+
+/* CTRL_PI_I_SEP. Provisional value: replace after measuring the plant. */
+#define I_SEP_BAND_DEGC 5.0f            // Integrate only within this error
+
+/* CTRL_PI_S_CURVE. Provisional values: replace after measuring the plant. */
+#define S_RATE_DEGC_PER_SEC 0.5f
+#define S_ACCEL_DEGC_PER_SEC2 0.05f
+
+/* CTRL_PI_FUZZY. Provisional values: replace after measuring the plant. */
+#define FUZZY_SIZE_COUNT 3              // Error rows: small, medium, large
+#define FUZZY_RATE_COUNT 3              // Rate columns: approaching, still, leaving
+#define FUZZY_ERR_MID_DEGC 2.5f
+#define FUZZY_ERR_LARGE_DEGC 5.0f
+#define FUZZY_RATE_BAND_DEGC_PER_SEC 0.2f
+#define FUZZY_PV_RATE_TAU_SEC 1.0f      // PV rate filter time constant
+
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
 /*****************************************************************************/
@@ -131,6 +151,7 @@ typedef enum
 {
 	AW_BACK_CALCULATION,
 	AW_CONDITIONAL_INTEGRATION,
+	AW_HOLD,
 } anti_windup_et;
 
 typedef enum
@@ -200,6 +221,15 @@ typedef struct {
 	// CTRL_PI_ADAPTIVE
 	adaptive_st Ad;
 
+	// CTRL_PI_SPLIT: last controller output, heating positive
+	float HeatMvPrev;
+
+	// CTRL_PI_S_CURVE: speed of the internal setpoint (degC/s)
+	float SvRate;
+
+	// CTRL_PI_FUZZY: filtered PV rate (degC/s)
+	float PvRate;
+
 	// Values of the last calculation, for logging
 	float AppliedKp, AppliedTi;
 	float SvRef, PTerm, ITerm, DTerm, MvCalc;
@@ -234,6 +264,12 @@ static __RAM_FUNC float PI_sv_rate_calculate( pid_st *pPid, float sp, float pv, 
 static __RAM_FUNC float gs_interpolate( float const points[ GS_POINT_COUNT ], float const table[ GS_POINT_COUNT ], float x );
 static __RAM_FUNC float PI_gain_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
 static __RAM_FUNC float PI_error_scheduled_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC float linear_interpolate( float const *points, float const *values, int count, float x );
+static __RAM_FUNC float PI_split_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC float PI_integral_separation_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC float PI_s_curve_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
+static __RAM_FUNC void fuzzy_gain_multipliers( float error, float pv_rate, float *kp_mult, float *ki_mult );
+static __RAM_FUNC float PI_fuzzy_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat );
 static __RAM_FUNC bool adaptive_smps_voltage_limited( control_loop_config_st const *pCfg );
 static __RAM_FUNC void adaptive_update( pid_st *pPid, float y, float u, bool blocked, float action );
 static __RAM_FUNC float PI_adaptive_calculate( pid_st *pPid, control_loop_config_st const *pCfg, float sp, float pv );
@@ -291,6 +327,35 @@ static const float gs_err_mult[ GS_DIRECTION_COUNT ][ GS_POINT_COUNT ] =
 {
 	[ GS_TEMP_RISING ]  = { 0.5f, 0.5f, 0.75f, 1.0f },
 	[ GS_TEMP_FALLING ] = { 0.5f, 0.5f, 0.75f, 1.0f },
+};
+
+/* CTRL_PI_SPLIT gain multiplier by the last heating-positive output. */
+static const float split_mv_points[ 2 ] = { -SPLIT_ZERO_MV, SPLIT_ZERO_MV };
+static const float split_kp_mult[ 2 ] = { SPLIT_COOL_GAIN, 1.0f };
+
+/* CTRL_PI_FUZZY membership functions. Provisional values, not measured. */
+static const float fuzzy_err_small_points[ 2 ] = { 0.0f, FUZZY_ERR_MID_DEGC };
+static const float fuzzy_err_medium_points[ 3 ] = { 0.0f, FUZZY_ERR_MID_DEGC, FUZZY_ERR_LARGE_DEGC };
+static const float fuzzy_err_large_points[ 2 ] = { FUZZY_ERR_MID_DEGC, FUZZY_ERR_LARGE_DEGC };
+static const float fuzzy_rate_approach_points[ 2 ] = { 0.0f, FUZZY_RATE_BAND_DEGC_PER_SEC };
+static const float fuzzy_rate_still_points[ 3 ] = { -FUZZY_RATE_BAND_DEGC_PER_SEC, 0.0f, FUZZY_RATE_BAND_DEGC_PER_SEC };
+static const float fuzzy_rate_leave_points[ 2 ] = { -FUZZY_RATE_BAND_DEGC_PER_SEC, 0.0f };
+static const float fuzzy_member_falling[ 2 ] = { 1.0f, 0.0f };
+static const float fuzzy_member_rising[ 2 ] = { 0.0f, 1.0f };
+static const float fuzzy_member_peak[ 3 ] = { 0.0f, 1.0f, 0.0f };
+
+/* CTRL_PI_FUZZY rule tables. Provisional values, not measured. Columns: approaching, still, leaving. */
+static const float fuzzy_kp_mult[ FUZZY_SIZE_COUNT ][ FUZZY_RATE_COUNT ] =
+{
+	{ 0.5f, 0.7f, 1.0f },	// small error
+	{ 0.8f, 1.0f, 1.1f },	// medium error
+	{ 1.0f, 1.0f, 1.2f },	// large error
+};
+static const float fuzzy_ki_mult[ FUZZY_SIZE_COUNT ][ FUZZY_RATE_COUNT ] =
+{
+	{ 0.5f, 1.0f, 1.2f },	// small error
+	{ 0.5f, 0.8f, 1.0f },	// medium error
+	{ 0.5f, 0.5f, 0.8f },	// large error
 };
 
 static int loop_idx = 0;
@@ -399,6 +464,10 @@ void ControllerTask( void )
 					case CTRL_PI_GS:
 					case CTRL_PI_ADAPTIVE:
 					case CTRL_PI_GS_ERR:
+					case CTRL_PI_SPLIT:
+					case CTRL_PI_I_SEP:
+					case CTRL_PI_S_CURVE:
+					case CTRL_PI_FUZZY:
 						pid_calculation( pCfg, pInst );
 						break;
 					case CTRL_ONOFF:
@@ -493,7 +562,7 @@ static void set_default_config( int32_t loop_idx )
 	pCfg->OutputMin = -1000;                // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	pCfg->PWMFreq = 10;                     // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	pCfg->OutputDelay = 0;                  // default: 0         / Range: 0 ~ 999 (sec)
-	pCfg->ControlType = CTRL_PID;           // default: PID       / Range: 0 ~ 9 ( control_et )
+	pCfg->ControlType = CTRL_PID;           // default: PID       / Range: 0 ~ 13 ( control_et )
 	pCfg->CoolHeat = COOL_CTRL_MODE;        // default: COOL      / Range: COOL, HEAT
 	pCfg->StartDelay = 10;                  // default: 10        / Range: 0 ~ 999 (sec)
 	pCfg->SmpsLeakageCurrent = 100;         // default: 100       / Range: 0 ~ 60000 (mA)
@@ -779,6 +848,18 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				case CTRL_PI_GS_ERR:		// 7: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
 					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
+				case CTRL_PI_SPLIT:			// 8: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
+					pInst->MV = PI_split_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_I_SEP:			// 9: 적분 분리 PI (오차가 크면 적분 정지)
+					pInst->MV = PI_integral_separation_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_S_CURVE:		// 10: S자 SV 프로파일 PI (내부 SV를 가감속하며 이동)
+					pInst->MV = PI_s_curve_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_FUZZY:			// 11: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
+					pInst->MV = PI_fuzzy_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
 				case CTRL_2DOF_PID:			// 1: 2자유도 PID (SV 필터 적용)
 				default:
 					pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat );
@@ -921,7 +1002,11 @@ static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mo
 		Ki_term = ( Kp / Ti ) * error * Ts;
 	}
 
-	if( AW_CONDITIONAL_INTEGRATION == aw )
+	if( AW_HOLD == aw )
+	{
+		// 이번 주기에는 적분을 갱신하지 않는다 (Ki 항, 역계산 항 모두).
+	}
+	else if( AW_CONDITIONAL_INTEGRATION == aw )
 	{
 		// 포화 방향으로 오차가 더 밀어 올리는 동안에는 적분을 멈춘다.
 		bool push_over_max = ( mv_calc > pPID->u_max ) && ( error > 0.0f );
@@ -975,6 +1060,9 @@ static __RAM_FUNC void PID_instance_Start( pid_st *pPid, float pv )
 	if( pPid->Started ) return;
 
 	pPid->Started = true;
+	pPid->HeatMvPrev = 0.0f;
+	pPid->SvRate = 0.0f;
+	pPid->PvRate = 0.0f;
 	pPid->SP_prev = pv;
 	pPid->SP_ref_prev = pv;
 	pPid->PV_prev = pv;
@@ -1169,6 +1257,172 @@ static __RAM_FUNC float PI_error_scheduled_calculate( pid_st *pPid, float sp, fl
 	const float mult = gs_interpolate( gs_err_points, gs_err_mult[ direction ], fabsf( diff ) );
 
 	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * mult, pPid->Ti * mult, AW_BACK_CALCULATION );
+}
+
+/******************************************************************************
+ * @brief Linear interpolation over any number of points.
+ *
+ * @param points Input value of each point, in increasing order
+ * @param values Value at each point
+ * @param count Number of points
+ * @param x Input value
+ * @return Interpolated value. Clamped to the first and last points.
+ ******************************************************************************/
+static __RAM_FUNC float linear_interpolate( float const *points, float const *values, int count, float x )
+{
+	if( x <= points[ 0 ] ) return values[ 0 ];
+
+	for( int idx = 1; idx < count; ++idx )
+	{
+		if( x <= points[ idx ] )
+		{
+			float ratio = ( x - points[ idx - 1 ] ) / ( points[ idx ] - points[ idx - 1 ] );
+
+			return values[ idx - 1 ] + ratio * ( values[ idx ] - values[ idx - 1 ] );
+		}
+	}
+
+	return values[ count - 1 ];
+}
+
+/******************************************************************************
+ * @brief PI with separate cooling and heating gains. The multiplier follows the
+ * last heating-positive output. The integral holds near zero output and error.
+ *
+ * HeatMvPrev comes from the PID_core result, so a start or output delay that
+ * overwrites pInst->MV does not change it.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_split_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	const float action = ( COOL_CTRL_MODE == cool_heat ) ? -1.0f : 1.0f;
+	const float error = sp - pv;
+	const float mult = linear_interpolate( split_mv_points, split_kp_mult, 2, pPid->HeatMvPrev );
+	const anti_windup_et aw = ( ( fabsf( pPid->HeatMvPrev ) < SPLIT_ZERO_MV ) && ( fabsf( error ) < SPLIT_ZERO_ERR ) ) ? AW_HOLD : AW_BACK_CALCULATION;
+	const float mv = PID_core( pPid, sp, pv, cool_heat, pPid->Kp * mult, pPid->Ti, aw );
+
+	pPid->HeatMvPrev = action * mv;
+
+	return mv;
+}
+
+/******************************************************************************
+ * @brief PI that holds the accumulated integral while the error is large.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_integral_separation_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	const anti_windup_et aw = ( fabsf( sp - pv ) > I_SEP_BAND_DEGC ) ? AW_HOLD : AW_BACK_CALCULATION;
+
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp, pPid->Ti, aw );
+}
+
+/******************************************************************************
+ * @brief PI with an internal setpoint that accelerates, cruises and decelerates
+ * toward SV. The internal setpoint starts from the PV at enable.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_s_curve_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	const float max_step = S_ACCEL_DEGC_PER_SEC2 * pPid->Ts;
+	float ref = pPid->SP_ref_prev;
+	const float dist = sp - ref;
+	const float target = copysignf( fminf( S_RATE_DEGC_PER_SEC, sqrtf( 2.0f * S_ACCEL_DEGC_PER_SEC2 * fabsf( dist ) ) ), dist );
+
+	pPid->SvRate += fmaxf( -max_step, fminf( max_step, target - pPid->SvRate ) );
+	ref += pPid->SvRate * pPid->Ts;
+
+	if( ( sp - ref ) * dist <= 0.0f )
+	{
+		ref = sp;
+		pPid->SvRate = 0.0f;
+	}
+
+	pPid->SP_ref_prev = ref;
+
+	return PID_core( pPid, ref, pv, cool_heat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+}
+
+/******************************************************************************
+ * @brief Weighted average of the fuzzy rule table.
+ *
+ * @param error Physical error, SV - PV (degC)
+ * @param pv_rate Filtered PV rate (degC/s)
+ * @param kp_mult Kp multiplier
+ * @param ki_mult Ki multiplier
+ ******************************************************************************/
+static __RAM_FUNC void fuzzy_gain_multipliers( float error, float pv_rate, float *kp_mult, float *ki_mult )
+{
+	const float size = fabsf( error );
+	const float rate = copysignf( 1.0f, error ) * pv_rate;	// rate > 0: moving toward SV
+	const float size_member[ FUZZY_SIZE_COUNT ] =
+	{
+		linear_interpolate( fuzzy_err_small_points, fuzzy_member_falling, 2, size ),
+		linear_interpolate( fuzzy_err_medium_points, fuzzy_member_peak, 3, size ),
+		linear_interpolate( fuzzy_err_large_points, fuzzy_member_rising, 2, size ),
+	};
+	const float rate_member[ FUZZY_RATE_COUNT ] =
+	{
+		linear_interpolate( fuzzy_rate_approach_points, fuzzy_member_rising, 2, rate ),
+		linear_interpolate( fuzzy_rate_still_points, fuzzy_member_peak, 3, rate ),
+		linear_interpolate( fuzzy_rate_leave_points, fuzzy_member_falling, 2, rate ),
+	};
+	float total = 0.0f;
+	float kp_sum = 0.0f;
+	float ki_sum = 0.0f;
+
+	for( int row = 0; row < FUZZY_SIZE_COUNT; ++row )
+	{
+		for( int col = 0; col < FUZZY_RATE_COUNT; ++col )
+		{
+			const float weight = size_member[ row ] * rate_member[ col ];
+
+			total += weight;
+			kp_sum += weight * fuzzy_kp_mult[ row ][ col ];
+			ki_sum += weight * fuzzy_ki_mult[ row ][ col ];
+		}
+	}
+
+	*kp_mult = kp_sum / total;
+	*ki_mult = ki_sum / total;
+}
+
+/******************************************************************************
+ * @brief PI with Kp and Ki multipliers from a fuzzy rule table of the error size
+ * and the PV rate toward SV.
+ *
+ * @param pPid Pointer to pid_st structure
+ * @param sp Setpoint Value (SP)
+ * @param pv Process Value (PV)
+ * @param cool_heat Control direction
+ * @return Manipulated Value (MV)
+ ******************************************************************************/
+static __RAM_FUNC float PI_fuzzy_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
+{
+	const float Ts = pPid->Ts;
+	float kp_mult, ki_mult;
+
+	/* PV_prev is updated inside PID_core, so the rate is calculated before the call. */
+	pPid->PvRate += ( Ts / ( FUZZY_PV_RATE_TAU_SEC + Ts ) ) * ( ( ( pv - pPid->PV_prev ) / Ts ) - pPid->PvRate );
+
+	fuzzy_gain_multipliers( sp - pv, pPid->PvRate, &kp_mult, &ki_mult );
+
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * kp_mult, pPid->Ti * kp_mult / ki_mult, AW_BACK_CALCULATION );
 }
 
 /******************************************************************************
@@ -1485,6 +1739,9 @@ static __RAM_FUNC void PID_instance_Init( pid_st *pPid, control_loop_config_st *
 	pPid->PV_prev = 0.0f;
 
 	pPid->Started = false;
+	pPid->HeatMvPrev = 0.0f;
+	pPid->SvRate = 0.0f;
+	pPid->PvRate = 0.0f;
 	pPid->GsValid = false;
 	pPid->GsSp = 0.0f;
 	pPid->GsKpMult = 1.0f;

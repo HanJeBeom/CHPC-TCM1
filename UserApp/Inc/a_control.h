@@ -35,7 +35,7 @@ extern "C" {
 #define CONTROL_TYPE_IS_VALID( type )	( ( type ) <= CTRL_BYPASS )
 
 /* Control types that need PB, Ti or Td from the PLC. CTRL_PI_ADAPTIVE decides its own gains. */
-#define CONTROL_TYPE_USES_PLC_GAIN( type )	( ( ( type ) <= CTRL_PI_GS_ERR ) && ( ( type ) != CTRL_PI_ADAPTIVE ) )
+#define CONTROL_TYPE_USES_PLC_GAIN( type )	( ( ( type ) <= CTRL_PI_FUZZY ) && ( ( type ) != CTRL_PI_ADAPTIVE ) )
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/

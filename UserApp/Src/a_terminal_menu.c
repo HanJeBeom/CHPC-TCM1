@@ -284,7 +284,7 @@ static void tfunc_loop_config_show( void * param )
 	tprintf("OutputMin          : %.1f\r\n", pCfg->OutputMin * 0.1f        );    // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	tprintf("PWMFreq            : %.1f\r\n", pCfg->PWMFreq * 0.1f          );    // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	tprintf("OutputDelay        : %d\r\n", pCfg->OutputDelay               );    // default: 0         / Range: 0 ~ 999 (sec)
-	tprintf("ControlType        : %d\r\n", pCfg->ControlType               );    // default: PID       / Range: 0 ~ 13 ( control_et )
+	tprintf("ControlType        : %d\r\n", pCfg->ControlType               );    // default: PID_PROD  / Range: 0 ~ 13 ( control_et )
 	tprintf("StartDelay         : %d\r\n", pCfg->StartDelay                );    // default: 10        / Range: 0 ~ 999 (sec)
 	tprintf("SmpsLeakageCurrent : %d\r\n", pCfg->SmpsLeakageCurrent        );    // default: 100       / Range: 0 ~ 65535 (mA)
 	tprintf("SmpsConfig     	: %d\r\n", pCfg->SmpsConfig.all            );    // default: 0         / Range: 

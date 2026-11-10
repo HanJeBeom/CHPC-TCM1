@@ -38,7 +38,6 @@
 #define SMPS_CMD_STATUS_RESET		( 1 << 2 )
 #define SMPS_DEFAULT_CH_ON			( 0xf << 3 )
 
-#define ENABLE_TRANSFER_FUNCTION_FOR_SMPS_LOW_POWER_RANGE_AND_RESPONSE_DELAY	( 0 )
 
 /*****************************************************************************/
 /** DATATYPES ****************************************************************/
@@ -87,6 +86,7 @@ static __RAM_FUNC void run_pwm( output_et out_type, int8_t out_ch, float mv, ...
 static __RAM_FUNC uint8_t stop_pwm( output_et type, int8_t out_ch, ... );
 static __RAM_FUNC uint8_t set_smps_comm( output_et out_type, int8_t out_ch, ... );
 static __RAM_FUNC void run_smps_comm( output_et out_type, int8_t out_ch, float smps_mv, ... );
+static __RAM_FUNC float smps_mv_r00_transfer( float smps_mv );
 static __RAM_FUNC uint8_t stop_smps_comm( output_et out_type, int8_t out_ch, ... );
 static __RAM_FUNC uint8_t set_smps_analog( output_et out_type, int8_t out_ch, ... );
 static __RAM_FUNC void run_smps_analog( output_et out_type, int8_t out_ch, float smps_mv, ... );
@@ -702,11 +702,46 @@ static uint8_t set_smps_comm( output_et out_type, int8_t out_ch, ... )
 }
 
 /******************************************************************************
- * @brief 
- * 
- * @param out_type 
- * @param out_ch 
- * @param smps_mv 
+ * @brief MV to SMPS command transfer function of GitLab chpc-tcm1 tag R00, unchanged.
+ * Reference: Jang Seokju of Chiller Development part.
+ *
+ * Within 5 % the value is not changed: R00 halves iMV there but does not write
+ * it back to smps_mv. Above 5 % a polynomial is used, so 5.1 % gives about 1.4 %.
+ *
+ * @param smps_mv MV from the controller (-1.0 ~ 1.0)
+ * @return Value sent to the SMPS
+ *****************************************************************************/
+static float smps_mv_r00_transfer( float smps_mv )
+{
+	int16_t iMV = smps_mv * 1000.0f;
+	if( abs(iMV) <= 50 )
+	{
+		iMV /= 2;
+	}
+	else
+	{
+		if( iMV < 0 )
+		{
+			iMV *= -1;
+			smps_mv = (-1.9424E-11f*iMV)*iMV*iMV*iMV*iMV + (4.41E-8f*iMV)*iMV*iMV*iMV - (3.3907E-5f*iMV)*iMV*iMV + (1.597E-2f*iMV)*iMV + 1.345f*iMV + 6.3486f;
+			smps_mv *= -1.0f;
+		}
+		else
+		{
+			smps_mv = (-1.9424E-11f*iMV)*iMV*iMV*iMV*iMV + (4.41E-8f*iMV)*iMV*iMV*iMV - (3.3907E-5f*iMV)*iMV*iMV + (1.597E-2f*iMV)*iMV + 1.345f*iMV + 6.3486f;
+		}
+		smps_mv /= 8000.0f;
+	}
+
+	return smps_mv;
+}
+
+/******************************************************************************
+ * @brief
+ *
+ * @param out_type
+ * @param out_ch
+ * @param smps_mv
  *****************************************************************************/
 static void run_smps_comm( output_et out_type, int8_t out_ch, float smps_mv, ... )
 {
@@ -719,36 +754,11 @@ static void run_smps_comm( output_et out_type, int8_t out_ch, float smps_mv, ...
 	{
 		make_smps_mbm_query( out_ch, out_type, SMPS_CMD_READ, 0, pCfg->SmpsLeakageCurrent, pCfg->SmpsConfig.all );
 
-		#if ENABLE_TRANSFER_FUNCTION_FOR_SMPS_LOW_POWER_RANGE_AND_RESPONSE_DELAY
-		//if( pCfg->Reserved == 0 )
+		/* Only the production controller keeps the R00 transfer function, so it runs as on the production unit. */
+		if( CTRL_PID_PROD == pCfg->ControlType )
 		{
-			// Reference : from Jang Seokju of Chiller Development part
-
-			int16_t iMV = smps_mv * 1000.0f;
-			if( abs( iMV ) <= 50 )
-			{
-				// Use half the value if less than 5%.
-				smps_mv /= 2.0f;
-			}
-			else
-			{
-				// iMV is pre-mille (1/1000) scale.
-				// Since the formula below scales smps_mv by 1/8000,
-				// it must be normalized back to a floating-point range of [-1.0, 1.0].
-				if( iMV < 0 )
-				{
-					iMV *= -1;
-					smps_mv = (-1.9424E-11f*iMV)*iMV*iMV*iMV*iMV + (4.41E-8f*iMV)*iMV*iMV*iMV - (3.3907E-5f*iMV)*iMV*iMV + (1.597E-2f*iMV)*iMV + 1.345f*iMV + 6.3486f;
-					smps_mv *= -1.0f;
-				}
-				else
-				{
-					smps_mv = (-1.9424E-11f*iMV)*iMV*iMV*iMV*iMV + (4.41E-8f*iMV)*iMV*iMV*iMV - (3.3907E-5f*iMV)*iMV*iMV + (1.597E-2f*iMV)*iMV + 1.345f*iMV + 6.3486f;
-				}
-				smps_mv /= 8000.0f;
-			}
+			smps_mv = smps_mv_r00_transfer( smps_mv );
 		}
-	#endif
 		make_smps_mbm_query( out_ch, out_type, SMPS_CMD_WRITE, smps_mv, pCfg->SmpsLeakageCurrent, pCfg->SmpsConfig.all );
 	}
 }

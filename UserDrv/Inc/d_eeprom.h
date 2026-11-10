@@ -68,9 +68,9 @@ typedef enum __packed output_type_enum_Tag
 typedef enum __packed control_type_enum_Tag
 {
 	/* Selectable by PLC. CONTROL_TYPE_USES_PLC_GAIN tells which ones use PLC gains. */
-	CTRL_PID = 0,			// 0: General PID (no setpoint filter)
-	CTRL_2DOF_PID,			// 1: 2-DoF PID (setpoint filter)
-	CTRL_PID_PROD,			// 2: Production PID (formula of GitLab chpc-tcm1 main)
+	CTRL_PID_PROD = 0,		// 0: Production PID (formula of GitLab chpc-tcm1 R00, with R00 output transfer function)
+	CTRL_PID,				// 1: General PID (no setpoint filter)
+	CTRL_2DOF_PID,			// 2: 2-DoF PID (setpoint filter)
 	CTRL_PI_COND_I,			// 3: PI with conditional integration
 	CTRL_PI_SV_RATE,		// 4: PI with setpoint rate limit
 	CTRL_PI_GS,				// 5: Gain-scheduled PI by SV
@@ -142,7 +142,7 @@ typedef struct __packed control_loop_config_struct_Tag
 	int16_t OutputMin;              // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	uint16_t PWMFreq;               // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	uint16_t OutputDelay;           // default: 0         / Range: 0 ~ 999 (sec)
-	control_et ControlType:16;      // default: PID       / Range: 0 ~ 13 ( control_et )
+	control_et ControlType:16;      // default: PID_PROD  / Range: 0 ~ 13 ( control_et )
 	cool_heat_mode_et CoolHeat:16;  // default: Cool      / Range: COOL : 0, Heat : 1
 	uint16_t StartDelay;            // default: 10        / Range: 0 ~ 999 (sec)
 	uint16_t SmpsLeakageCurrent;    // default: 100       / Range: 0 ~ 65535 (mA)

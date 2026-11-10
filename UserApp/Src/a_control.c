@@ -562,7 +562,7 @@ static void set_default_config( int32_t loop_idx )
 	pCfg->OutputMin = -1000;                // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	pCfg->PWMFreq = 10;                     // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	pCfg->OutputDelay = 0;                  // default: 0         / Range: 0 ~ 999 (sec)
-	pCfg->ControlType = CTRL_PID;           // default: PID       / Range: 0 ~ 13 ( control_et )
+	pCfg->ControlType = CTRL_PID_PROD;      // default: PID_PROD  / Range: 0 ~ 13 ( control_et )
 	pCfg->CoolHeat = COOL_CTRL_MODE;        // default: COOL      / Range: COOL, HEAT
 	pCfg->StartDelay = 10;                  // default: 10        / Range: 0 ~ 999 (sec)
 	pCfg->SmpsLeakageCurrent = 100;         // default: 100       / Range: 0 ~ 60000 (mA)
@@ -827,11 +827,11 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 
 			switch( pCfg->ControlType )
 			{
-				case CTRL_PID:				// 0: 일반 PID (포화 시 역계산으로 I항 보정)
-					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
-					break;
-				case CTRL_PID_PROD:			// 2: 양산 PID (GitLab chpc-tcm1 main의 계산식)
+				case CTRL_PID_PROD:			// 0: 양산 PID (GitLab chpc-tcm1 R00의 계산식)
 					pInst->MV = PID_production_calculate( pPid, pCfg, pInst, dt, sp, pv );
+					break;
+				case CTRL_PID:				// 1: 일반 PID (포화 시 역계산으로 I항 보정)
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
 					break;
 				case CTRL_PI_COND_I:		// 3: 조건부 적분 PI (포화를 키우는 방향이면 적분 정지)
 					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
@@ -860,7 +860,7 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				case CTRL_PI_FUZZY:			// 11: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
 					pInst->MV = PI_fuzzy_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_2DOF_PID:			// 1: 2자유도 PID (SV 필터 적용)
+				case CTRL_2DOF_PID:			// 2: 2자유도 PID (SV 필터 적용)
 				default:
 					pInst->MV = PID2DOF_Calculate_backward_euler( pPid, sp, pv, pCfg->CoolHeat );
 					break;
@@ -1070,8 +1070,14 @@ static __RAM_FUNC void PID_instance_Start( pid_st *pPid, float pv )
 }
 
 /******************************************************************************
- * @brief Production PID. Formula of pid_calculation() in GitLab chpc-tcm1 main,
- * except that Kp uses the same PB unit as the other controllers.
+ * @brief Production PID. Formula of pid_calculation() in GitLab chpc-tcm1 tag R00
+ * (the "#if 1" branch), with two differences:
+ * - Kp uses the same PB unit as the other controllers.
+ * - With Ti = 0 the second integral step is 0. R00 divides by Ti there.
+ *
+ * As in R00, the integral step is added twice per cycle while MV is inside the
+ * limits, and once per cycle while MV is limited (no anti-windup). Saturated_I
+ * limits only the first step.
  *
  * @param pPid Pointer to pid_st structure (diagnostics only)
  * @param pCfg Pointer to control_loop_config_st structure
@@ -1114,28 +1120,31 @@ static __RAM_FUNC float PID_production_calculate( pid_st *pPid, control_loop_con
 	}
 
 	float proportion = error;
-	float differential = ( error - pInst->lastError ) / dt * Td;
+	float derivate = ( error - pInst->lastError ) / dt * Td;
+	float integral_temp = ( Ti > 0.0f ) ? ( Kp * error * dt / Ti ) : 0.0f;
 
-	fMV = Kp * ( proportion + differential ) + pInst->IntegralSum;
+	fMV = Kp * ( proportion + derivate ) + pInst->IntegralSum + integral_temp;
 
 	pPid->SvRef = sp;
 	pPid->PTerm = Kp * proportion;
-	pPid->ITerm = pInst->IntegralSum;
-	pPid->DTerm = Kp * differential;
+	pPid->ITerm = pInst->IntegralSum + integral_temp;
+	pPid->DTerm = Kp * derivate;
 	pPid->MvCalc = fMV;
 
 	if( isfinite( fMV ) )
 	{
-		// MV Limitation and Anti-Windup
+		// MV Limitation. As in R00, the integral keeps the first step while MV is limited.
 		if( fMV > fOutputMax )
 		{
-			pInst->IntegralSum = fOutputMax - Kp * ( proportion + differential );
 			fMV = fOutputMax;
 		}
 		else if( fMV < fOutputMin )
 		{
-			pInst->IntegralSum = fOutputMin - Kp * ( proportion + differential );
 			fMV = fOutputMin;
+		}
+		else
+		{
+			pInst->IntegralSum += integral_temp;
 		}
 	}
 	else

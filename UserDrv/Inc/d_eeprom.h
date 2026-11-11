@@ -75,8 +75,8 @@ typedef enum __packed control_type_enum_Tag
 	CTRL_PI_BACK_CALC,		// 4: PI with back-calculation anti-windup
 	CTRL_PI_SV_RATE,		// 5: PI with setpoint rate limit
 	CTRL_PI_GS,				// 6: Gain-scheduled PI by SV
-	CTRL_PI_ADAPTIVE,		// 7: Adaptive PI (gains decided by firmware)
-	CTRL_PI_GS_ERR,			// 8: Gain-scheduled PI by SV-PV error
+	CTRL_PI_GS_ERR,			// 7: Gain-scheduled PI by SV-PV error
+	CTRL_PI_ADAPTIVE,		// 8: Adaptive PI (gains decided by firmware)
 	CTRL_PI_SPLIT,			// 9: PI with separate heating and cooling gains
 	CTRL_PI_I_SEP,			// 10: PI with integral separation
 	CTRL_PI_S_CURVE,		// 11: PI with S-curve setpoint profile

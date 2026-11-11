@@ -149,8 +149,9 @@ typedef struct controller_variable_struct_Tag
 
 typedef enum
 {
-	AW_BACK_CALCULATION,
-	AW_CONDITIONAL_INTEGRATION,
+	AW_NONE,						// 포화 처리 없음 (I += Ki_term)
+	AW_BACK_CALCULATION,			// 현재 호출 없음. 나중에 옵션으로 사용
+	AW_CONDITIONAL_INTEGRATION,		// 3번에서 사용
 	AW_HOLD,
 } anti_windup_et;
 
@@ -830,8 +831,8 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				case CTRL_PID_PROD:			// 0: 양산 PID (GitLab chpc-tcm1 R00의 계산식)
 					pInst->MV = PID_production_calculate( pPid, pCfg, pInst, dt, sp, pv );
 					break;
-				case CTRL_PID:				// 1: 일반 PID (포화 시 역계산으로 I항 보정)
-					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+				case CTRL_PID:				// 1: 일반 PID
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_NONE );
 					break;
 				case CTRL_PI_COND_I:		// 3: 조건부 적분 PI (포화를 키우는 방향이면 적분 정지)
 					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
@@ -925,7 +926,7 @@ static __RAM_FUNC float PID2DOF_Calculate_backward_euler( pid_st *pPID, float sp
 		SP_ref = sp; // Ti가 0이면 필터 없이 통과
 	}
 
-	float mv = PID_core( pPID, SP_ref, pv, cool_heat, pPID->Kp, Ti, AW_BACK_CALCULATION );
+	float mv = PID_core( pPID, SP_ref, pv, cool_heat, pPID->Kp, Ti, AW_NONE );
 
 	// 목표값 필터의 다음 스텝을 위해 현재 상태 저장
 	pPID->SP_ref_prev = SP_ref;
@@ -993,9 +994,7 @@ static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mo
 		mv_final = pPID->u_min;
 	}
 
-	// 7. 적분항 anti-windup 업데이트 (Back-calculation)
-	// 수식: I[k+1] = I[k] + (Ki * error * Ts) + (Kb * (mv_final - mv_calc) * Ts)
-	// mv_final - mv_calc는 초과된 양(오차)을 의미합니다.
+	// 7. 적분항 업데이트. 방식은 aw 인자로 정한다.
 	float Ki_term = 0.0f;
 	if( Ti > 0.0f )
 	{
@@ -1005,6 +1004,11 @@ static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mo
 	if( AW_HOLD == aw )
 	{
 		// 이번 주기에는 적분을 갱신하지 않는다 (Ki 항, 역계산 항 모두).
+	}
+	else if( AW_NONE == aw )
+	{
+		// 포화 여부와 상관없이 오차만 적분한다.
+		pPID->I += Ki_term;
 	}
 	else if( AW_CONDITIONAL_INTEGRATION == aw )
 	{
@@ -1019,14 +1023,11 @@ static __RAM_FUNC float PID_core( pid_st *pPID, float sp, float pv, cool_heat_mo
 	}
 	else
 	{
-		// Saturation 오차 (실제 출력 - 계산된 출력)
+		// 역계산 anti-windup: MV가 상하한에 잘린 양에 비례해 적분값을 되돌린다. 안 잘리면 일반 적분과 같다.
 		float saturation_diff = mv_final - mv_calc;
-
-		// 역계산 항 (Tracking Term)
 		float Kaw = ( Ti > 0.0f ) ? ( 1.0f / Ti ) : 0.0f;
 		float back_calc_term = Kaw * saturation_diff * Ts;
 
-		// 다음 주기를 위한 적분값 누적
 		pPID->I += Ki_term + back_calc_term;
 	}
 
@@ -1194,7 +1195,7 @@ static __RAM_FUNC float PI_sv_rate_calculate( pid_st *pPid, float sp, float pv, 
 
 	pPid->SP_ref_prev = sp_ref;
 
-	return PID_core( pPid, sp_ref, pv, cool_heat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+	return PID_core( pPid, sp_ref, pv, cool_heat, pPid->Kp, pPid->Ti, AW_NONE );
 }
 
 /******************************************************************************
@@ -1245,7 +1246,7 @@ static __RAM_FUNC float PI_gain_scheduled_calculate( pid_st *pPid, float sp, flo
 		pPid->GsValid = true;
 	}
 
-	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * pPid->GsKpMult, pPid->Ti * pPid->GsTiMult, AW_BACK_CALCULATION );
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * pPid->GsKpMult, pPid->Ti * pPid->GsTiMult, AW_NONE );
 }
 
 /******************************************************************************
@@ -1265,7 +1266,7 @@ static __RAM_FUNC float PI_error_scheduled_calculate( pid_st *pPid, float sp, fl
 	const int direction = ( diff > 0.0f ) ? GS_TEMP_RISING : GS_TEMP_FALLING;
 	const float mult = gs_interpolate( gs_err_points, gs_err_mult[ direction ], fabsf( diff ) );
 
-	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * mult, pPid->Ti * mult, AW_BACK_CALCULATION );
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * mult, pPid->Ti * mult, AW_NONE );
 }
 
 /******************************************************************************
@@ -1312,7 +1313,7 @@ static __RAM_FUNC float PI_split_calculate( pid_st *pPid, float sp, float pv, co
 	const float action = ( COOL_CTRL_MODE == cool_heat ) ? -1.0f : 1.0f;
 	const float error = sp - pv;
 	const float mult = linear_interpolate( split_mv_points, split_kp_mult, 2, pPid->HeatMvPrev );
-	const anti_windup_et aw = ( ( fabsf( pPid->HeatMvPrev ) < SPLIT_ZERO_MV ) && ( fabsf( error ) < SPLIT_ZERO_ERR ) ) ? AW_HOLD : AW_BACK_CALCULATION;
+	const anti_windup_et aw = ( ( fabsf( pPid->HeatMvPrev ) < SPLIT_ZERO_MV ) && ( fabsf( error ) < SPLIT_ZERO_ERR ) ) ? AW_HOLD : AW_NONE;
 	const float mv = PID_core( pPid, sp, pv, cool_heat, pPid->Kp * mult, pPid->Ti, aw );
 
 	pPid->HeatMvPrev = action * mv;
@@ -1331,7 +1332,7 @@ static __RAM_FUNC float PI_split_calculate( pid_st *pPid, float sp, float pv, co
  ******************************************************************************/
 static __RAM_FUNC float PI_integral_separation_calculate( pid_st *pPid, float sp, float pv, cool_heat_mode_et cool_heat )
 {
-	const anti_windup_et aw = ( fabsf( sp - pv ) > I_SEP_BAND_DEGC ) ? AW_HOLD : AW_BACK_CALCULATION;
+	const anti_windup_et aw = ( fabsf( sp - pv ) > I_SEP_BAND_DEGC ) ? AW_HOLD : AW_NONE;
 
 	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp, pPid->Ti, aw );
 }
@@ -1364,7 +1365,7 @@ static __RAM_FUNC float PI_s_curve_calculate( pid_st *pPid, float sp, float pv, 
 
 	pPid->SP_ref_prev = ref;
 
-	return PID_core( pPid, ref, pv, cool_heat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+	return PID_core( pPid, ref, pv, cool_heat, pPid->Kp, pPid->Ti, AW_NONE );
 }
 
 /******************************************************************************
@@ -1431,7 +1432,7 @@ static __RAM_FUNC float PI_fuzzy_calculate( pid_st *pPid, float sp, float pv, co
 
 	fuzzy_gain_multipliers( sp - pv, pPid->PvRate, &kp_mult, &ki_mult );
 
-	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * kp_mult, pPid->Ti * kp_mult / ki_mult, AW_BACK_CALCULATION );
+	return PID_core( pPid, sp, pv, cool_heat, pPid->Kp * kp_mult, pPid->Ti * kp_mult / ki_mult, AW_NONE );
 }
 
 /******************************************************************************
@@ -1577,7 +1578,7 @@ static __RAM_FUNC float PI_adaptive_calculate( pid_st *pPid, control_loop_config
 
 	const uint16_t window_samples = ( uint16_t )fmaxf( 1.0f, ( ADAPT_WINDOW_SEC / pPid->Ts ) + 0.5f );
 
-	float mv = PID_core( pPid, sp, pv, pCfg->CoolHeat, ad->Kp, ad->Ti, AW_BACK_CALCULATION );
+	float mv = PID_core( pPid, sp, pv, pCfg->CoolHeat, ad->Kp, ad->Ti, AW_NONE );
 
 	ad->SumU += mv;
 	ad->Samples++;

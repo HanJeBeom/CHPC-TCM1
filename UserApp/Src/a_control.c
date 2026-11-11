@@ -150,7 +150,7 @@ typedef struct controller_variable_struct_Tag
 typedef enum
 {
 	AW_NONE,						// 포화 처리 없음 (I += Ki_term)
-	AW_BACK_CALCULATION,			// 현재 호출 없음. 나중에 옵션으로 사용
+	AW_BACK_CALCULATION,			// 4번에서 사용
 	AW_CONDITIONAL_INTEGRATION,		// 3번에서 사용
 	AW_HOLD,
 } anti_windup_et;
@@ -461,6 +461,7 @@ void ControllerTask( void )
 					case CTRL_2DOF_PID:
 					case CTRL_PID_PROD:
 					case CTRL_PI_COND_I:
+					case CTRL_PI_BACK_CALC:
 					case CTRL_PI_SV_RATE:
 					case CTRL_PI_GS:
 					case CTRL_PI_ADAPTIVE:
@@ -563,7 +564,7 @@ static void set_default_config( int32_t loop_idx )
 	pCfg->OutputMin = -1000;                // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	pCfg->PWMFreq = 10;                     // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	pCfg->OutputDelay = 0;                  // default: 0         / Range: 0 ~ 999 (sec)
-	pCfg->ControlType = CTRL_PID_PROD;      // default: PID_PROD  / Range: 0 ~ 13 ( control_et )
+	pCfg->ControlType = CTRL_PID_PROD;      // default: PID_PROD  / Range: 0 ~ 14 ( control_et )
 	pCfg->CoolHeat = COOL_CTRL_MODE;        // default: COOL      / Range: COOL, HEAT
 	pCfg->StartDelay = 10;                  // default: 10        / Range: 0 ~ 999 (sec)
 	pCfg->SmpsLeakageCurrent = 100;         // default: 100       / Range: 0 ~ 60000 (mA)
@@ -837,28 +838,31 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				case CTRL_PI_COND_I:		// 3: 조건부 적분 PI (포화를 키우는 방향이면 적분 정지)
 					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
 					break;
-				case CTRL_PI_SV_RATE:		// 4: SV 변화율 제한 PI (내부 SV를 일정 속도로 이동)
+				case CTRL_PI_BACK_CALC:		// 4: 역계산 PI (포화 시 잘린 양에 비례해 적분값을 되돌림)
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+					break;
+				case CTRL_PI_SV_RATE:		// 5: SV 변화율 제한 PI (내부 SV를 일정 속도로 이동)
 					pInst->MV = PI_sv_rate_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_GS:			// 5: 게인 스케줄링 PI (SV와 승온/냉각 방향별 게인 배율)
+				case CTRL_PI_GS:			// 6: 게인 스케줄링 PI (SV와 승온/냉각 방향별 게인 배율)
 					pInst->MV = PI_gain_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_ADAPTIVE:		// 6: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
+				case CTRL_PI_ADAPTIVE:		// 7: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
 					pInst->MV = PI_adaptive_calculate( pPid, pCfg, sp, pv );
 					break;
-				case CTRL_PI_GS_ERR:		// 7: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
+				case CTRL_PI_GS_ERR:		// 8: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
 					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_SPLIT:			// 8: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
+				case CTRL_PI_SPLIT:			// 9: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
 					pInst->MV = PI_split_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_I_SEP:			// 9: 적분 분리 PI (오차가 크면 적분 정지)
+				case CTRL_PI_I_SEP:			// 10: 적분 분리 PI (오차가 크면 적분 정지)
 					pInst->MV = PI_integral_separation_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_S_CURVE:		// 10: S자 SV 프로파일 PI (내부 SV를 가감속하며 이동)
+				case CTRL_PI_S_CURVE:		// 11: S자 SV 프로파일 PI (내부 SV를 가감속하며 이동)
 					pInst->MV = PI_s_curve_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_FUZZY:			// 11: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
+				case CTRL_PI_FUZZY:			// 12: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
 					pInst->MV = PI_fuzzy_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
 				case CTRL_2DOF_PID:			// 2: 2자유도 PID (SV 필터 적용)

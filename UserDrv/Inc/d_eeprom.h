@@ -72,22 +72,23 @@ typedef enum __packed control_type_enum_Tag
 	CTRL_PID,				// 1: General PID (no setpoint filter)
 	CTRL_2DOF_PID,			// 2: 2-DoF PID (setpoint filter)
 	CTRL_PI_COND_I,			// 3: PI with conditional integration
-	CTRL_PI_SV_RATE,		// 4: PI with setpoint rate limit
-	CTRL_PI_GS,				// 5: Gain-scheduled PI by SV
-	CTRL_PI_ADAPTIVE,		// 6: Adaptive PI (gains decided by firmware)
-	CTRL_PI_GS_ERR,			// 7: Gain-scheduled PI by SV-PV error
-	CTRL_PI_SPLIT,			// 8: PI with separate heating and cooling gains
-	CTRL_PI_I_SEP,			// 9: PI with integral separation
-	CTRL_PI_S_CURVE,		// 10: PI with S-curve setpoint profile
-	CTRL_PI_FUZZY,			// 11: PI with fuzzy gain multipliers
-	CTRL_ONOFF,				// 12: On/Off
-	CTRL_BYPASS,			// 13: MV from PLC
+	CTRL_PI_BACK_CALC,		// 4: PI with back-calculation anti-windup
+	CTRL_PI_SV_RATE,		// 5: PI with setpoint rate limit
+	CTRL_PI_GS,				// 6: Gain-scheduled PI by SV
+	CTRL_PI_ADAPTIVE,		// 7: Adaptive PI (gains decided by firmware)
+	CTRL_PI_GS_ERR,			// 8: Gain-scheduled PI by SV-PV error
+	CTRL_PI_SPLIT,			// 9: PI with separate heating and cooling gains
+	CTRL_PI_I_SEP,			// 10: PI with integral separation
+	CTRL_PI_S_CURVE,		// 11: PI with S-curve setpoint profile
+	CTRL_PI_FUZZY,			// 12: PI with fuzzy gain multipliers
+	CTRL_ONOFF,				// 13: On/Off
+	CTRL_BYPASS,			// 14: MV from PLC
 
 	/* Not selectable by PLC */
-	CTRL_SLIDING,			// 14
-	CTRL_NN,				// 15
-	CTRL_FULL_TEST,			// 16
-	CTRL_HALF_TEST,			// 17
+	CTRL_SLIDING,			// 15
+	CTRL_NN,				// 16
+	CTRL_FULL_TEST,			// 17
+	CTRL_HALF_TEST,			// 18
 
 	control_et_max = 0xffff
 } control_et;
@@ -142,7 +143,7 @@ typedef struct __packed control_loop_config_struct_Tag
 	int16_t OutputMin;              // default: -1000     / Range: -1000 ~ 1000 ( * 0.1% )
 	uint16_t PWMFreq;               // default: 10        / Range: 0 ~ 60000 ( 0.1Hz )
 	uint16_t OutputDelay;           // default: 0         / Range: 0 ~ 999 (sec)
-	control_et ControlType:16;      // default: PID_PROD  / Range: 0 ~ 13 ( control_et )
+	control_et ControlType:16;      // default: PID_PROD  / Range: 0 ~ 14 ( control_et )
 	cool_heat_mode_et CoolHeat:16;  // default: Cool      / Range: COOL : 0, Heat : 1
 	uint16_t StartDelay;            // default: 10        / Range: 0 ~ 999 (sec)
 	uint16_t SmpsLeakageCurrent;    // default: 100       / Range: 0 ~ 65535 (mA)

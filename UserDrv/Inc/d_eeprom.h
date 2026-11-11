@@ -71,16 +71,16 @@ typedef enum __packed control_type_enum_Tag
 	CTRL_PID_PROD = 0,		// 0: Production PID (formula of GitLab chpc-tcm1 R00, with R00 output transfer function)
 	CTRL_PID,				// 1: General PID (no setpoint filter)
 	CTRL_2DOF_PID,			// 2: 2-DoF PID (setpoint filter)
-	CTRL_PI_COND_I,			// 3: PI with conditional integration
-	CTRL_PI_BACK_CALC,		// 4: PI with back-calculation anti-windup
-	CTRL_PI_SV_RATE,		// 5: PI with setpoint rate limit
-	CTRL_PI_GS,				// 6: Gain-scheduled PI by SV
-	CTRL_PI_GS_ERR,			// 7: Gain-scheduled PI by SV-PV error
-	CTRL_PI_ADAPTIVE,		// 8: Adaptive PI (gains decided by firmware)
-	CTRL_PI_SPLIT,			// 9: PI with separate heating and cooling gains
-	CTRL_PI_I_SEP,			// 10: PI with integral separation
-	CTRL_PI_S_CURVE,		// 11: PI with S-curve setpoint profile
-	CTRL_PI_FUZZY,			// 12: PI with fuzzy gain multipliers
+	CTRL_PI_SV_RATE,		// 3: PI with setpoint rate limit
+	CTRL_PI_S_CURVE,		// 4: PI with S-curve setpoint profile
+	CTRL_PI_COND_I,			// 5: PI with conditional integration
+	CTRL_PI_BACK_CALC,		// 6: PI with back-calculation anti-windup
+	CTRL_PI_I_SEP,			// 7: PI with integral separation
+	CTRL_PI_GS,				// 8: Gain-scheduled PI by SV
+	CTRL_PI_ADAPTIVE,		// 9: Adaptive PI (gains decided by firmware)
+	CTRL_PI_SPLIT,			// 10: PI with separate heating and cooling gains
+	CTRL_PI_FUZZY,			// 11: PI with fuzzy gain multipliers
+	CTRL_PI_GS_ERR,			// 12: Gain-scheduled PI by SV-PV error
 	CTRL_ONOFF,				// 13: On/Off
 	CTRL_BYPASS,			// 14: MV from PLC
 

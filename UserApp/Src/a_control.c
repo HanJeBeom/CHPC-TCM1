@@ -150,8 +150,8 @@ typedef struct controller_variable_struct_Tag
 typedef enum
 {
 	AW_NONE,						// 포화 처리 없음 (I += Ki_term)
-	AW_BACK_CALCULATION,			// 4번에서 사용
-	AW_CONDITIONAL_INTEGRATION,		// 3번에서 사용
+	AW_BACK_CALCULATION,			// 6번에서 사용
+	AW_CONDITIONAL_INTEGRATION,		// 5번에서 사용
 	AW_HOLD,
 } anti_windup_et;
 
@@ -460,16 +460,16 @@ void ControllerTask( void )
 					case CTRL_PID:
 					case CTRL_2DOF_PID:
 					case CTRL_PID_PROD:
+					case CTRL_PI_SV_RATE:
+					case CTRL_PI_S_CURVE:
 					case CTRL_PI_COND_I:
 					case CTRL_PI_BACK_CALC:
-					case CTRL_PI_SV_RATE:
+					case CTRL_PI_I_SEP:
 					case CTRL_PI_GS:
-					case CTRL_PI_GS_ERR:
 					case CTRL_PI_ADAPTIVE:
 					case CTRL_PI_SPLIT:
-					case CTRL_PI_I_SEP:
-					case CTRL_PI_S_CURVE:
 					case CTRL_PI_FUZZY:
+					case CTRL_PI_GS_ERR:
 						pid_calculation( pCfg, pInst );
 						break;
 					case CTRL_ONOFF:
@@ -835,35 +835,35 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				case CTRL_PID:				// 1: 일반 PID
 					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_NONE );
 					break;
-				case CTRL_PI_COND_I:		// 3: 조건부 적분 PI (포화를 키우는 방향이면 적분 정지)
-					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
-					break;
-				case CTRL_PI_BACK_CALC:		// 4: 역계산 PI (포화 시 잘린 양에 비례해 적분값을 되돌림)
-					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
-					break;
-				case CTRL_PI_SV_RATE:		// 5: SV 변화율 제한 PI (내부 SV를 일정 속도로 이동)
+				case CTRL_PI_SV_RATE:		// 3: SV 변화율 제한 PI (내부 SV를 일정 속도로 이동)
 					pInst->MV = PI_sv_rate_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_GS:			// 6: 게인 스케줄링 PI (SV와 승온/냉각 방향별 게인 배율)
-					pInst->MV = PI_gain_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
-					break;
-				case CTRL_PI_GS_ERR:		// 7: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
-					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
-					break;
-				case CTRL_PI_ADAPTIVE:		// 8: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
-					pInst->MV = PI_adaptive_calculate( pPid, pCfg, sp, pv );
-					break;
-				case CTRL_PI_SPLIT:			// 9: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
-					pInst->MV = PI_split_calculate( pPid, sp, pv, pCfg->CoolHeat );
-					break;
-				case CTRL_PI_I_SEP:			// 10: 적분 분리 PI (오차가 크면 적분 정지)
-					pInst->MV = PI_integral_separation_calculate( pPid, sp, pv, pCfg->CoolHeat );
-					break;
-				case CTRL_PI_S_CURVE:		// 11: S자 SV 프로파일 PI (내부 SV를 가감속하며 이동)
+				case CTRL_PI_S_CURVE:		// 4: S자 SV 프로파일 PI (내부 SV를 가감속하며 이동)
 					pInst->MV = PI_s_curve_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_FUZZY:			// 12: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
+				case CTRL_PI_COND_I:		// 5: 조건부 적분 PI (포화를 키우는 방향이면 적분 정지)
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_CONDITIONAL_INTEGRATION );
+					break;
+				case CTRL_PI_BACK_CALC:		// 6: 역계산 PI (포화 시 잘린 양에 비례해 적분값을 되돌림)
+					pInst->MV = PID_core( pPid, sp, pv, pCfg->CoolHeat, pPid->Kp, pPid->Ti, AW_BACK_CALCULATION );
+					break;
+				case CTRL_PI_I_SEP:			// 7: 적분 분리 PI (오차가 크면 적분 정지)
+					pInst->MV = PI_integral_separation_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_GS:			// 8: 게인 스케줄링 PI (SV와 승온/냉각 방향별 게인 배율)
+					pInst->MV = PI_gain_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_ADAPTIVE:		// 9: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
+					pInst->MV = PI_adaptive_calculate( pPid, pCfg, sp, pv );
+					break;
+				case CTRL_PI_SPLIT:			// 10: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
+					pInst->MV = PI_split_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_FUZZY:			// 11: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
 					pInst->MV = PI_fuzzy_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_GS_ERR:		// 12: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
+					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
 				case CTRL_2DOF_PID:			// 2: 2자유도 PID (SV 필터 적용)
 				default:

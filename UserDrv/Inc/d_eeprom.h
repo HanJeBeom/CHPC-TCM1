@@ -77,10 +77,10 @@ typedef enum __packed control_type_enum_Tag
 	CTRL_PI_BACK_CALC,		// 6: PI with back-calculation anti-windup
 	CTRL_PI_I_SEP,			// 7: PI with integral separation
 	CTRL_PI_GS,				// 8: Gain-scheduled PI by SV
-	CTRL_PI_ADAPTIVE,		// 9: Adaptive PI (gains decided by firmware)
-	CTRL_PI_SPLIT,			// 10: PI with separate heating and cooling gains
-	CTRL_PI_FUZZY,			// 11: PI with fuzzy gain multipliers
-	CTRL_PI_GS_ERR,			// 12: Gain-scheduled PI by SV-PV error
+	CTRL_PI_GS_ERR,			// 9: Gain-scheduled PI by SV-PV error
+	CTRL_PI_ADAPTIVE,		// 10: Adaptive PI (gains decided by firmware)
+	CTRL_PI_SPLIT,			// 11: PI with separate heating and cooling gains
+	CTRL_PI_FUZZY,			// 12: PI with fuzzy gain multipliers
 	CTRL_ONOFF,				// 13: On/Off
 	CTRL_BYPASS,			// 14: MV from PLC
 

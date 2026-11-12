@@ -466,10 +466,10 @@ void ControllerTask( void )
 					case CTRL_PI_BACK_CALC:
 					case CTRL_PI_I_SEP:
 					case CTRL_PI_GS:
+					case CTRL_PI_GS_ERR:
 					case CTRL_PI_ADAPTIVE:
 					case CTRL_PI_SPLIT:
 					case CTRL_PI_FUZZY:
-					case CTRL_PI_GS_ERR:
 						pid_calculation( pCfg, pInst );
 						break;
 					case CTRL_ONOFF:
@@ -853,17 +853,17 @@ static __RAM_FUNC int16_t pid_calculation( control_loop_config_st *pCfg, control
 				case CTRL_PI_GS:			// 8: 게인 스케줄링 PI (SV와 승온/냉각 방향별 게인 배율)
 					pInst->MV = PI_gain_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_ADAPTIVE:		// 9: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
+				case CTRL_PI_GS_ERR:		// 9: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
+					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
+					break;
+				case CTRL_PI_ADAPTIVE:		// 10: 적응형 PI (플랜트를 추정해 Kp, Ti를 직접 결정)
 					pInst->MV = PI_adaptive_calculate( pPid, pCfg, sp, pv );
 					break;
-				case CTRL_PI_SPLIT:			// 10: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
+				case CTRL_PI_SPLIT:			// 11: 가열/냉각 분리 PI (직전 출력 방향별 게인 배율, 0 부근 적분 정지)
 					pInst->MV = PI_split_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
-				case CTRL_PI_FUZZY:			// 11: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
+				case CTRL_PI_FUZZY:			// 12: 퍼지 게인 PI (오차와 PV 속도별 Kp, Ki 배율)
 					pInst->MV = PI_fuzzy_calculate( pPid, sp, pv, pCfg->CoolHeat );
-					break;
-				case CTRL_PI_GS_ERR:		// 12: 오차 구간 게인 스케줄링 PI (|SV - PV|와 승온/냉각 방향별 게인 배율)
-					pInst->MV = PI_error_scheduled_calculate( pPid, sp, pv, pCfg->CoolHeat );
 					break;
 				case CTRL_2DOF_PID:			// 2: 2자유도 PID (SV 필터 적용)
 				default:
